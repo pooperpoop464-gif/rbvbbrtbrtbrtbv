@@ -37,6 +37,7 @@ local KEYS = {
     HidePlayers = K.F8,
     FovDown     = K.LeftBracket,
     FovUp       = K.RightBracket,
+    God         = K.F10,
     Exit        = K.Backspace,
 }
 
@@ -54,6 +55,7 @@ local KEY_LABELS = {
     {"HidePlayers", "Скрыть игроков"},
     {"FovDown", "FOV меньше"},
     {"FovUp", "FOV больше"},
+    {"God", "Бессмертие вкл/выкл"},
     {"Exit", "Выйти из всех режимов"},
 }
 
@@ -93,6 +95,7 @@ local S = {
     tween = nil,
     hidden = false, hideSelf = false,
     night = false, timeLock = false, origTime = Lighting.ClockTime,
+    god = false,
 }
 
 local npcs = {}
@@ -480,6 +483,77 @@ end)
 ---------------------------------------------------------------------
 -- Обновление камеры каждый кадр
 ---------------------------------------------------------------------
+---------------------------------------------------------------------
+-- Бессмертие (клиентское: работает, если урон считается на клиенте)
+---------------------------------------------------------------------
+local godConns = {}
+local godCharConn
+local godHum, godOrigMax
+
+local function godRelease()
+    for _, c in ipairs(godConns) do c:Disconnect() end
+    godConns = {}
+    if godHum and godHum.Parent then
+        pcall(function()
+            godHum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+            if godOrigMax then
+                godHum.MaxHealth = godOrigMax
+                godHum.Health = godOrigMax
+            end
+        end)
+    end
+    godHum, godOrigMax = nil, nil
+end
+
+local function godApply(char)
+    godRelease()
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    godHum = hum
+    if hum.MaxHealth ~= math.huge then godOrigMax = hum.MaxHealth end
+    pcall(function()
+        hum.MaxHealth = math.huge
+        hum.Health = math.huge
+        hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+    end)
+    table.insert(godConns, hum.HealthChanged:Connect(function()
+        if S.god and hum.Health < hum.MaxHealth then
+            pcall(function() hum.Health = hum.MaxHealth end)
+        end
+    end))
+    table.insert(godConns, hum.StateChanged:Connect(function(_, new)
+        if S.god and new == Enum.HumanoidStateType.Dead then
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        end
+    end))
+end
+
+local function toggleGod(force)
+    local want = (force == nil) and (not S.god) or force
+    S.god = want
+    if godCharConn then godCharConn:Disconnect() godCharConn = nil end
+    if want then
+        godApply(lp.Character)
+        godCharConn = lp.CharacterAdded:Connect(function(c)
+            task.wait(0.2)
+            if S.god then godApply(c) end
+        end)
+        status("Бессмертие включено")
+    else
+        godRelease()
+        status("Бессмертие выключено")
+    end
+    refreshButtons()
+end
+
+local function healSelf()
+    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function() hum.Health = (hum.MaxHealth == math.huge) and math.huge or hum.MaxHealth end)
+        status("Здоровье восстановлено")
+    end
+end
+
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
@@ -620,6 +694,7 @@ local ACTIONS = {
         if S.mode == "none" then getCam().FieldOfView = S.fov end
         refreshButtons()
     end,
+    God = function() toggleGod() end,
     Exit = exitAll,
     TogglePanel = function() if gui then gui.Enabled = not gui.Enabled end end,
 }
@@ -880,7 +955,7 @@ end
 -- Вкладка Мир
 do
     local p = pages["Мир"]
-    local g = grid(p, 140)
+    local g = grid(p, 160)
     B.night = gbtn(g, "День <-> Ночь", toggleDayNight)
     gbtn(g, "Сбросить время", resetTime)
     B.hide = gbtn(g, "Скрыть игроков", function() toggleHide() end)
@@ -893,7 +968,9 @@ do
     gbtn(g, "FOV +", ACTIONS.FovUp)
     gbtn(g, "Скорость камеры -", function() S.speed = math.clamp(S.speed / 1.3, 2, 500) refreshButtons() end)
     gbtn(g, "Скорость камеры +", function() S.speed = math.clamp(S.speed * 1.3, 2, 500) refreshButtons() end)
-    B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 150),
+    B.god = gbtn(g, "Бессмертие", function() toggleGod() end)
+    gbtn(g, "Вылечить себя", healSelf)
+    B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 166),
         BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
 end
@@ -924,6 +1001,7 @@ refreshButtons = function()
     mark(B.free, S.mode == "free")
     mark(B.hide, S.hidden)
     mark(B.night, S.timeLock and S.night)
+    mark(B.god, S.god)
     B.smooth.Text = "Плавно: " .. (S.smooth and "ВКЛ" or "ВЫКЛ")
     B.markers.Text = "Маркеры: " .. (S.markers and "ВКЛ" or "ВЫКЛ")
     B.hideSelf.Text = "Скрывать и себя: " .. (S.hideSelf and "ДА" or "НЕТ")
@@ -956,6 +1034,7 @@ genv.__CinePanelCleanup = function()
     unbindSink()
     S.timeLock = false
     clearHide()
+    toggleGod(false)
     if markerFolder then markerFolder:Destroy() end
     pcall(function() RunService:UnbindFromRenderStep("CinePanel") end)
     for _, c in ipairs(conns) do c:Disconnect() end
