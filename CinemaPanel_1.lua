@@ -38,6 +38,9 @@ local KEYS = {
     FovDown     = K.LeftBracket,
     FovUp       = K.RightBracket,
     God         = K.F10,
+    HideNPCs    = K.Delete,
+    PlayersAsNPC = K.End,
+    CaptureNPC  = K.Home,
     Exit        = K.Backspace,
 }
 
@@ -56,6 +59,9 @@ local KEY_LABELS = {
     {"FovDown", "FOV меньше"},
     {"FovUp", "FOV больше"},
     {"God", "Бессмертие вкл/выкл"},
+    {"HideNPCs", "Скрыть всех NPC (выбранный виден)"},
+    {"PlayersAsNPC", "Игроки = модели NPC"},
+    {"CaptureNPC", "Скопировать выбранного NPC"},
     {"Exit", "Выйти из всех режимов"},
 }
 
@@ -96,6 +102,8 @@ local S = {
     hidden = false, hideSelf = false,
     night = false, timeLock = false, origTime = Lighting.ClockTime,
     god = false,
+    hideNPC = false, swap = false, listPlayers = false,
+    selfEntry = nil, allEntry = nil,
 }
 
 local npcs = {}
@@ -106,6 +114,8 @@ local status = function(_) end
 local refreshButtons = function() end
 local rebuildNPCList = function() end
 local rebuildCamList = function() end
+local updateNPCHide = function() end
+local function isSkinModel(m) return m.Parent ~= nil and m.Parent.Name == "CineSkins" end
 
 ---------------------------------------------------------------------
 -- Утилиты
@@ -124,7 +134,9 @@ local function scanNPCs()
     for _, h in ipairs(workspace:GetDescendants()) do
         if h:IsA("Humanoid") then
             local m = h.Parent
-            if m and m:IsA("Model") and not Players:GetPlayerFromCharacter(m) and h.Health > 0 then
+            local plr = m and m:IsA("Model") and Players:GetPlayerFromCharacter(m)
+            if m and m:IsA("Model") and not isSkinModel(m) and (not plr or (S.listPlayers and plr ~= lp))
+                and h.Health > 0 then
                 local r = rootOf(m)
                 if r then
                     if not seen[m] then
@@ -262,6 +274,7 @@ end
 
 local function setTarget(m)
     S.target = m
+    updateNPCHide()
     if S.mode == "spec" then
         enterSpec(S.view)
     else
@@ -554,6 +567,672 @@ local function healSelf()
     end
 end
 
+---------------------------------------------------------------------
+-- Модели: библиотека, скины, скрытие NPC, подмена игроков
+-- (всё только визуально и только на вашем клиенте)
+---------------------------------------------------------------------
+-- Слоты библиотеки: вставьте ID модели в панели (вкладка «Модели»)
+local PRESETS = {"Huggy Wuggy", "Kissy Missy", "Mommy Long Legs", "CatNap"}
+local LIB_FILE = "CinePanel_library.json"
+local LIB, libSel = {}, nil
+local rebuildLibList = function() end
+
+local VH = {}               -- визуально скрытые модели
+local skins = {}            -- [персонаж] = данные скина
+local skinFolder
+local swapTemplates = {}
+local swapPrevHide, swapPrevList = false, false
+
+local function visProps(d)
+    if d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture") then
+        return "Transparency", 1
+    elseif d:IsA("BillboardGui") or d:IsA("SurfaceGui") or d:IsA("Highlight")
+        or d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") then
+        return "Enabled", false
+    end
+end
+
+local function vhHide(model, who)
+    local rec = VH[model]
+    if not rec then
+        rec = {orig = {}, who = {}}
+        local function h(d)
+            local prop, hid = visProps(d)
+            if prop then
+                if rec.orig[d] == nil then rec.orig[d] = {prop, hid, d[prop]} end
+                d[prop] = hid
+            end
+        end
+        for _, d in ipairs(model:GetDescendants()) do h(d) end
+        rec.conn = model.DescendantAdded:Connect(h)
+        VH[model] = rec
+    end
+    rec.who[who] = true
+end
+
+local function vhShow(model, who)
+    local rec = VH[model]
+    if not rec then return end
+    rec.who[who] = nil
+    if next(rec.who) then return end
+    rec.conn:Disconnect()
+    for d, info in pairs(rec.orig) do
+        if d.Parent then pcall(function() d[info[1]] = info[3] end) end
+    end
+    VH[model] = nil
+end
+
+local function vhClearAll()
+    for m, rec in pairs(VH) do
+        rec.conn:Disconnect()
+        for d, info in pairs(rec.orig) do
+            if d.Parent then pcall(function() d[info[1]] = info[3] end) end
+        end
+        VH[m] = nil
+    end
+end
+
+-- клонирование (даже если Archivable = false); возвращает модель с nil-родителем
+local function cloneModel(m)
+    local touched = {}
+    for _, d in ipairs(m:GetDescendants()) do
+        if not d.Archivable then
+            d.Archivable = true
+            touched[#touched + 1] = d
+        end
+    end
+    local wasArch = m.Archivable
+    m.Archivable = true
+    local ok, c = pcall(function() return m:Clone() end)
+    for _, d in ipairs(touched) do pcall(function() d.Archivable = false end) end
+    m.Archivable = wasArch
+    if not ok or not c then return nil end
+    local rec = VH[m]
+    if rec then -- вернуть настоящие значения, если оригинал сейчас скрыт нами
+        local a, b = m:GetDescendants(), c:GetDescendants()
+        if #a == #b then
+            for i, d in ipairs(a) do
+                local info = rec.orig[d]
+                if info then pcall(function() b[i][info[1]] = info[3] end) end
+            end
+        end
+    end
+    return c
+end
+
+local function loadAssetModel(id)
+    local obj
+    local ok, res = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
+    if ok and type(res) == "table" and res[1] then obj = res[1] end
+    if not obj then
+        ok, res = pcall(function() return game:GetService("InsertService"):LoadAsset(id) end)
+        if ok and res then obj = res end
+    end
+    if not obj then return nil end
+    local rig
+    if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+        rig = obj
+    else
+        for _, d in ipairs(obj:GetDescendants()) do
+            if d:IsA("Model") and d:FindFirstChildOfClass("Humanoid") then rig = d break end
+        end
+        rig = rig or (obj:IsA("Model") and obj) or obj:FindFirstChildWhichIsA("Model", true)
+    end
+    if rig then rig.Parent = nil end
+    return rig
+end
+
+local function enumByValue(enum, v)
+    for _, it in ipairs(enum:GetEnumItems()) do
+        if it.Value == v then return it end
+    end
+end
+
+local function origVal(model, d, prop)
+    local rec = VH[model]
+    local info = rec and rec.orig[d]
+    if info and info[1] == prop then return info[3] end
+    return d[prop]
+end
+
+local function v3(v) return {v.X, v.Y, v.Z} end
+
+-- описание модели в виде таблицы (для сохранения в файл и переноса в другие игры)
+local function serialize(model)
+    local root = rootOf(model)
+    if not root then return nil end
+    local rootCF = root.CFrame
+    local parts, idx = {}, {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") then
+            local e = {
+                n = d.Name, sz = v3(d.Size), cf = {rootCF:ToObjectSpace(d.CFrame):GetComponents()},
+                col = {d.Color.R, d.Color.G, d.Color.B}, mat = d.Material.Value,
+                tr = origVal(model, d, "Transparency"), rf = d.Reflectance,
+            }
+            if d:IsA("MeshPart") then
+                e.mid, e.tid, e.msz = d.MeshId, d.TextureID, v3(d.MeshSize)
+            else
+                e.cls = d.ClassName
+                if d:IsA("Part") then e.shape = d.Shape.Value end
+            end
+            for _, c in ipairs(d:GetChildren()) do
+                if c:IsA("SpecialMesh") then
+                    e.sm = {t = c.MeshType.Value, id = c.MeshId, tx = c.TextureId, sc = v3(c.Scale), of = v3(c.Offset)}
+                elseif c:IsA("SurfaceAppearance") then
+                    e.sa = {c = c.ColorMap, n = c.NormalMap, m = c.MetalnessMap, r = c.RoughnessMap}
+                elseif c:IsA("Decal") then
+                    e.dc = e.dc or {}
+                    table.insert(e.dc, {t = c.Texture, f = c.Face.Value, tr = origVal(model, c, "Transparency")})
+                end
+            end
+            parts[#parts + 1] = e
+            idx[d] = #parts
+        end
+    end
+    local joints = {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("JointInstance") and d.Part0 and d.Part1 and idx[d.Part0] and idx[d.Part1] then
+            joints[#joints + 1] = {k = d.ClassName, n = d.Name, a = idx[d.Part0], b = idx[d.Part1],
+                c0 = {d.C0:GetComponents()}, c1 = {d.C1:GetComponents()}}
+        elseif d:IsA("WeldConstraint") and d.Part0 and d.Part1 and idx[d.Part0] and idx[d.Part1] then
+            joints[#joints + 1] = {k = "WeldConstraint", n = d.Name, a = idx[d.Part0], b = idx[d.Part1]}
+        end
+    end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    return {name = model.Name, root = idx[root], parts = parts, joints = joints, hip = hum and hum.HipHeight or 0}
+end
+
+-- сборка модели из описания (работает в другой игре, если ассеты доступны)
+local function deserialize(desc)
+    local model = Instance.new("Model")
+    model.Name = desc.name or "Captured"
+    local parts, connected = {}, {}
+    for i, e in ipairs(desc.parts) do
+        local p
+        if e.mid and e.mid ~= "" then
+            local ok, mp = pcall(Instance.new, "MeshPart")
+            if ok and mp then
+                local ok2 = pcall(function() mp.MeshId = e.mid end)
+                if ok2 and mp.MeshId ~= "" then p = mp else mp:Destroy() end
+            end
+        end
+        if not p then
+            local cls = (e.cls == "WedgePart" or e.cls == "CornerWedgePart") and e.cls or "Part"
+            p = Instance.new(cls)
+            if e.mid and e.mid ~= "" then
+                local sm = Instance.new("SpecialMesh")
+                sm.MeshType = Enum.MeshType.FileMesh
+                sm.MeshId = e.mid
+                sm.TextureId = e.tid or ""
+                local ms = e.msz or {1, 1, 1}
+                sm.Scale = Vector3.new(e.sz[1] / math.max(ms[1], 1e-3), e.sz[2] / math.max(ms[2], 1e-3),
+                    e.sz[3] / math.max(ms[3], 1e-3))
+                sm.Parent = p
+            end
+        end
+        if p:IsA("MeshPart") and e.tid and e.tid ~= "" then pcall(function() p.TextureID = e.tid end) end
+        p.Name = e.n
+        p.Anchored, p.CanCollide, p.Massless = false, false, true
+        p.Size = Vector3.new(e.sz[1], e.sz[2], e.sz[3])
+        p.Color = Color3.new(e.col[1], e.col[2], e.col[3])
+        p.Material = enumByValue(Enum.Material, e.mat) or Enum.Material.Plastic
+        p.Transparency = e.tr or 0
+        p.Reflectance = e.rf or 0
+        if e.shape and p.ClassName == "Part" then
+            pcall(function() p.Shape = enumByValue(Enum.PartType, e.shape) end)
+        end
+        if e.sm then
+            local sm = Instance.new("SpecialMesh")
+            sm.MeshType = enumByValue(Enum.MeshType, e.sm.t) or Enum.MeshType.FileMesh
+            if e.sm.id and e.sm.id ~= "" then sm.MeshId = e.sm.id end
+            sm.TextureId = e.sm.tx or ""
+            sm.Scale = Vector3.new(table.unpack(e.sm.sc))
+            sm.Offset = Vector3.new(table.unpack(e.sm.of))
+            sm.Parent = p
+        end
+        for _, dd in ipairs(e.dc or {}) do
+            local dc = Instance.new("Decal")
+            dc.Texture = dd.t
+            dc.Face = enumByValue(Enum.NormalId, dd.f) or Enum.NormalId.Front
+            dc.Transparency = dd.tr or 0
+            dc.Parent = p
+        end
+        if e.sa and p:IsA("MeshPart") then
+            pcall(function()
+                local sa = Instance.new("SurfaceAppearance")
+                sa.ColorMap, sa.NormalMap, sa.MetalnessMap, sa.RoughnessMap = e.sa.c, e.sa.n, e.sa.m, e.sa.r
+                sa.Parent = p
+            end)
+        end
+        p.CFrame = CFrame.new(table.unpack(e.cf))
+        p.Parent = model
+        parts[i] = p
+    end
+    for _, j in ipairs(desc.joints or {}) do
+        local a, b = parts[j.a], parts[j.b]
+        if a and b then
+            connected[j.a], connected[j.b] = true, true
+            local ok, o = pcall(Instance.new, j.k)
+            if ok and o then
+                if j.k == "WeldConstraint" then
+                    o.Part0, o.Part1 = a, b
+                else
+                    o.Name = j.n
+                    o.C0 = CFrame.new(table.unpack(j.c0))
+                    o.C1 = CFrame.new(table.unpack(j.c1))
+                    o.Part0, o.Part1 = a, b
+                end
+                o.Parent = b
+            end
+        end
+    end
+    local root = parts[desc.root]
+    if not root then model:Destroy() return nil end
+    model.PrimaryPart = root
+    for i, p in ipairs(parts) do
+        if p ~= root and not connected[i] then
+            local w = Instance.new("WeldConstraint")
+            w.Part0, w.Part1 = root, p
+            w.Parent = p
+        end
+    end
+    model:SetAttribute("CineHip", desc.hip or 0)
+    return model
+end
+
+-- библиотека: сохранение/загрузка (общий файл для всех игр)
+local function saveLib()
+    if not writefile then return end
+    local t = {}
+    for _, e in ipairs(LIB) do
+        if e.kind == "capture" then
+            if e.desc then t[#t + 1] = {n = e.name, k = "capture", d = e.desc} end
+        else
+            t[#t + 1] = {n = e.name, k = "asset", id = e.id}
+        end
+    end
+    pcall(function() writefile(LIB_FILE, HttpService:JSONEncode(t)) end)
+end
+
+local function loadLib()
+    LIB = {}
+    if isfile and readfile then
+        local okE, ex = pcall(isfile, LIB_FILE)
+        if okE and ex then
+            local ok, t = pcall(function() return HttpService:JSONDecode(readfile(LIB_FILE)) end)
+            if ok and type(t) == "table" then
+                for _, e in ipairs(t) do
+                    table.insert(LIB, {name = e.n, kind = e.k, id = e.id, desc = e.d})
+                end
+            end
+        end
+    end
+    for _, nm in ipairs(PRESETS) do
+        local found = false
+        for _, e in ipairs(LIB) do
+            if e.name == nm then found = true break end
+        end
+        if not found then table.insert(LIB, {name = nm, kind = "asset"}) end
+    end
+end
+
+local function getSource(entry)
+    if entry.src and entry.src.Parent == nil then return entry.src end
+    if entry.failT and os.clock() - entry.failT < 5 then return nil end
+    local src
+    if entry.kind == "asset" then
+        if not entry.id then
+            status("У «" .. entry.name .. "» нет ID — введи ID и нажми «Добавить по ID»")
+            entry.failT = os.clock()
+            return nil
+        end
+        src = loadAssetModel(entry.id)
+    elseif entry.kind == "capture" and entry.desc then
+        local ok, m = pcall(deserialize, entry.desc)
+        if ok then src = m end
+    end
+    if src then
+        entry.src = src
+        entry.failT = nil
+    else
+        entry.failT = os.clock()
+        status("Не удалось загрузить: " .. entry.name)
+    end
+    return src
+end
+
+-- скины
+local function getSkinFolder()
+    if not skinFolder or not skinFolder.Parent then
+        skinFolder = Instance.new("Folder")
+        skinFolder.Name = "CineSkins"
+        skinFolder.Parent = workspace
+    end
+    return skinFolder
+end
+
+local function removeSkin(char)
+    local e = skins[char]
+    if not e then return end
+    skins[char] = nil
+    pcall(function() e.skin:Destroy() end)
+    vhShow(char, "skin")
+end
+
+local function buildSkin(src)
+    local skin = cloneModel(src)
+    if not skin then return nil end
+    local hum = skin:FindFirstChildOfClass("Humanoid")
+    local hip = (hum and hum.HipHeight) or skin:GetAttribute("CineHip") or 0
+    for _, d in ipairs(skin:GetDescendants()) do
+        pcall(function()
+            if d:IsA("LuaSourceContainer") or d:IsA("ProximityPrompt") or d:IsA("ClickDetector")
+                or d:IsA("ForceField") or d:IsA("Sound") then
+                d:Destroy()
+            elseif d:IsA("BasePart") then
+                d.CanCollide, d.CanQuery, d.CanTouch, d.Massless, d.Anchored = false, false, false, true, false
+            end
+        end)
+    end
+    if hum then -- humanoid оставляем (нужен для одежды), но делаем инертным
+        pcall(function()
+            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+            hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+            hum.BreakJointsOnDeath = false
+            hum.PlatformStand = true
+            hum.EvaluateStateMachine = false
+        end)
+    end
+    local root = skin:FindFirstChild("HumanoidRootPart") or skin.PrimaryPart or skin:FindFirstChildWhichIsA("BasePart", true)
+    if not root then skin:Destroy() return nil end
+    root.Anchored = true
+    return skin, root, hip
+end
+
+local function applySkin(char, src, entry)
+    removeSkin(char)
+    local origRoot = char:FindFirstChild("HumanoidRootPart") or rootOf(char)
+    if not origRoot then return false end
+    local skin, root, hip = buildSkin(src)
+    if not skin then return false end
+    skin.Name = "CineSkin"
+    root.CFrame = origRoot.CFrame
+    skin.Parent = getSkinFolder()
+    for _, d in ipairs(skin:GetDescendants()) do
+        pcall(function()
+            if d:IsA("BasePart") and d ~= root and d.AssemblyRootPart ~= root.AssemblyRootPart then
+                local w = Instance.new("WeldConstraint")
+                w.Part0, w.Part1 = root, d
+                w.Parent = d
+            end
+        end)
+    end
+    local origHum = char:FindFirstChildOfClass("Humanoid")
+    local origHip = origHum and origHum.HipHeight or 0
+    local offY = (hip + root.Size.Y / 2) - (origHip + origRoot.Size.Y / 2)
+    local origMotors, pairsList = {}, {}
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("Motor6D") then origMotors[d.Name] = d end
+    end
+    for _, d in ipairs(skin:GetDescendants()) do
+        if d:IsA("Motor6D") and origMotors[d.Name] then
+            pairsList[#pairsList + 1] = {d, origMotors[d.Name]}
+        end
+    end
+    vhHide(char, "skin")
+    skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY, motors = pairsList,
+        isPlayer = Players:GetPlayerFromCharacter(char) ~= nil, entry = entry, parked = false}
+    return true
+end
+
+RunService:BindToRenderStep("CineSkins", Enum.RenderPriority.Last.Value, function()
+    for char, e in pairs(skins) do
+        if not char.Parent or not e.origRoot.Parent then
+            removeSkin(char)
+        else
+            e.root.CFrame = e.origRoot.CFrame * CFrame.new(0, e.offY, 0)
+            for _, pr in ipairs(e.motors) do
+                if pr[1].Parent and pr[2].Parent then pr[1].Transform = pr[2].Transform end
+            end
+            local park = (S.hidden and e.isPlayer and (char ~= lp.Character or S.hideSelf)) and true or false
+            if park ~= e.parked then
+                e.parked = park
+                e.skin.Parent = park and nil or getSkinFolder()
+            end
+        end
+    end
+end)
+
+-- какую модель получает игрок
+local function desiredFor(p)
+    if p == lp then return S.selfEntry end
+    if S.allEntry then return S.allEntry end
+    if S.swap and #swapTemplates > 0 then
+        return swapTemplates[(p.UserId % #swapTemplates) + 1]
+    end
+end
+
+local function reconcile()
+    for _, p in ipairs(Players:GetPlayers()) do
+        local char = p.Character
+        if char and char.Parent and char:FindFirstChildOfClass("Humanoid") then
+            local want = desiredFor(p)
+            local cur = skins[char]
+            if want then
+                if not cur or cur.entry ~= want then
+                    local src = getSource(want)
+                    if src and applySkin(char, src, want) and p == lp then
+                        status("Модель применена: " .. want.name)
+                    end
+                end
+            elseif cur then
+                removeSkin(char)
+            end
+        end
+    end
+    for char in pairs(skins) do
+        if not char.Parent then removeSkin(char) end
+    end
+end
+
+local reconciling = false
+local function reconcileAsync()
+    if reconciling then return end
+    reconciling = true
+    task.spawn(function()
+        pcall(reconcile)
+        reconciling = false
+    end)
+end
+
+-- скрытие всех NPC (выбранный/наблюдаемый всегда виден)
+updateNPCHide = function()
+    if not S.hideNPC then
+        for m, rec in pairs(VH) do
+            if rec.who.npc then vhShow(m, "npc") end
+        end
+        return
+    end
+    local list = {}
+    for _, h in ipairs(workspace:GetDescendants()) do
+        if h:IsA("Humanoid") then
+            local m = h.Parent
+            if m and m:IsA("Model") and not isSkinModel(m) and not Players:GetPlayerFromCharacter(m) then
+                list[m] = true
+            end
+        end
+    end
+    for m in pairs(list) do
+        if m == S.target then vhShow(m, "npc") else vhHide(m, "npc") end
+    end
+    for m, rec in pairs(VH) do
+        if rec.who.npc and not list[m] then vhShow(m, "npc") end
+    end
+end
+
+local function toggleHideNPC(force)
+    if force == nil then force = not S.hideNPC end
+    S.hideNPC = force
+    updateNPCHide()
+    status(S.hideNPC and "NPC скрыты (выбранный виден)" or "NPC показаны")
+    refreshButtons()
+end
+
+local function buildTemplates()
+    for _, t in ipairs(swapTemplates) do
+        if t.src then pcall(function() t.src:Destroy() end) end
+    end
+    swapTemplates = {}
+    local byName = {}
+    for _, h in ipairs(workspace:GetDescendants()) do
+        if h:IsA("Humanoid") then
+            local m = h.Parent
+            if m and m:IsA("Model") and not isSkinModel(m) and not Players:GetPlayerFromCharacter(m)
+                and not byName[m.Name] and #swapTemplates < 24 and rootOf(m) then
+                local c = cloneModel(m)
+                if c then
+                    byName[m.Name] = true
+                    table.insert(swapTemplates, {name = m.Name, kind = "template", src = c})
+                end
+            end
+        end
+    end
+end
+
+local function toggleSwap(force)
+    if force == nil then force = not S.swap end
+    if force then
+        buildTemplates()
+        if #swapTemplates == 0 then
+            status("NPC не найдены — подменять нечем")
+            return
+        end
+        S.swap = true
+        swapPrevHide, swapPrevList = S.hideNPC, S.listPlayers
+        S.hideNPC, S.listPlayers = true, true
+        updateNPCHide()
+        reconcileAsync()
+        scanNPCs()
+        rebuildNPCList()
+        status("Игроки получили модели NPC (" .. #swapTemplates .. " шт.)")
+    else
+        S.swap = false
+        reconcile()
+        S.hideNPC, S.listPlayers = swapPrevHide, swapPrevList
+        updateNPCHide()
+        for _, t in ipairs(swapTemplates) do
+            if t.src then pcall(function() t.src:Destroy() end) end
+        end
+        swapTemplates = {}
+        scanNPCs()
+        rebuildNPCList()
+        status("Подмена игроков выключена")
+    end
+    refreshButtons()
+end
+
+-- действия библиотеки
+local function needSel()
+    if not libSel then status("Сначала выбери модель в списке") end
+    return libSel
+end
+
+local function applySelf()
+    local e = needSel()
+    if not e then return end
+    S.selfEntry = e
+    status("Загружаю модель: " .. e.name)
+    reconcileAsync()
+    rebuildLibList()
+end
+
+local function clearSelf()
+    S.selfEntry = nil
+    reconcileAsync()
+    status("Твоя модель возвращена")
+    rebuildLibList()
+end
+
+local function applyOthers()
+    local e = needSel()
+    if not e then return end
+    S.allEntry = e
+    status("Модель для других игроков: " .. e.name)
+    reconcileAsync()
+    rebuildLibList()
+end
+
+local function clearOthers()
+    S.allEntry = nil
+    reconcileAsync()
+    status("Модели других игроков возвращены")
+    rebuildLibList()
+end
+
+local function deleteSel()
+    local e = libSel
+    if not e then return end
+    for i, x in ipairs(LIB) do
+        if x == e then table.remove(LIB, i) break end
+    end
+    if S.selfEntry == e then S.selfEntry = nil end
+    if S.allEntry == e then S.allEntry = nil end
+    libSel = nil
+    saveLib()
+    reconcileAsync()
+    rebuildLibList()
+    status("Удалено: " .. e.name)
+end
+
+local function captureNPC()
+    local m = S.target
+    if not (m and m.Parent) then
+        if not pickNearest() then status("NPC не найдены") return end
+        m = S.target
+    end
+    local src = cloneModel(m)
+    if not src then status("Не удалось скопировать модель") return end
+    local ok, desc = pcall(serialize, m)
+    local base, name, n = m.Name, m.Name, 1
+    local function exists(nm)
+        for _, e in ipairs(LIB) do
+            if e.name == nm then return true end
+        end
+        return false
+    end
+    while exists(name) do
+        n = n + 1
+        name = base .. " #" .. n
+    end
+    local entry = {name = name, kind = "capture", src = src, desc = ok and desc or nil}
+    table.insert(LIB, entry)
+    libSel = entry
+    saveLib()
+    rebuildLibList()
+    status("Скопировано: " .. name .. (entry.desc and (writefile and " (сохранено в файл)" or "") or " (только в этой сессии)"))
+end
+
+local function addById(nameText, idText)
+    local id = tonumber((idText or ""):match("%d+"))
+    if not id then status("Введи числовой ID модели") return end
+    local name = (nameText or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then name = "Model " .. id end
+    local entry
+    for _, e in ipairs(LIB) do
+        if e.name == name then entry = e break end
+    end
+    if not entry then
+        entry = {name = name}
+        table.insert(LIB, entry)
+    end
+    entry.kind, entry.id, entry.src, entry.desc, entry.failT = "asset", id, nil, nil, nil
+    libSel = entry
+    saveLib()
+    rebuildLibList()
+    status("Добавлено: " .. name .. " (ID " .. id .. ")")
+end
+
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
@@ -695,6 +1374,9 @@ local ACTIONS = {
         refreshButtons()
     end,
     God = function() toggleGod() end,
+    HideNPCs = function() toggleHideNPC() end,
+    PlayersAsNPC = function() toggleSwap() end,
+    CaptureNPC = captureNPC,
     Exit = exitAll,
     TogglePanel = function() if gui then gui.Enabled = not gui.Enabled end end,
 }
@@ -833,7 +1515,7 @@ end, {Size = UDim2.fromOffset(24, 20), Position = UDim2.new(1, -28, 0, 5), Backg
 
 -- вкладки
 local pages, tabBtns = {}, {}
-local tabNames = {"NPC", "Камеры", "Мир", "Клавиши"}
+local tabNames = {"NPC", "Камеры", "Мир", "Модели", "Клавиши"}
 local tabBar = new("Frame", {Size = UDim2.new(1, -16, 0, 26), Position = UDim2.fromOffset(8, 34), BackgroundTransparency = 1}, main)
 new("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4),
     SortOrder = Enum.SortOrder.LayoutOrder}, tabBar)
@@ -844,7 +1526,7 @@ local function showTab(name)
 end
 
 for i, n in ipairs(tabNames) do
-    local b = btn(tabBar, n, function() showTab(n) end, {Size = UDim2.new(0.25, -3, 1, 0), LayoutOrder = i})
+    local b = btn(tabBar, n, function() showTab(n) end, {Size = UDim2.new(0.2, -3, 1, 0), LayoutOrder = i, TextSize = 11})
     tabBtns[n] = b
     pages[n] = new("Frame", {Size = UDim2.new(1, -16, 1, -96), Position = UDim2.fromOffset(8, 66),
         BackgroundTransparency = 1, Visible = false}, main)
@@ -975,6 +1657,64 @@ do
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
 end
 
+-- Вкладка Модели
+do
+    local p = pages["Модели"]
+    local g = grid(p, 154)
+    gbtn(g, "На себя", applySelf)
+    gbtn(g, "Снять с себя", clearSelf)
+    gbtn(g, "На других игроков", applyOthers)
+    gbtn(g, "Снять с других", clearOthers)
+    gbtn(g, "Скопировать NPC", captureNPC)
+    gbtn(g, "Удалить из списка", deleteSel)
+    B.hideNPC = gbtn(g, "", function() toggleHideNPC() end)
+    B.swap = gbtn(g, "", function() toggleSwap() end)
+    B.listPlayers = gbtn(g, "", function()
+        S.listPlayers = not S.listPlayers
+        scanNPCs()
+        rebuildNPCList()
+        refreshButtons()
+    end)
+
+    local function box(placeholder, pos, size)
+        local b = new("TextBox", {Size = size, Position = pos, PlaceholderText = placeholder, Text = "",
+            ClearTextOnFocus = false, BackgroundColor3 = PANEL, TextColor3 = TXT,
+            PlaceholderColor3 = Color3.fromRGB(140, 140, 150), Font = Enum.Font.Gotham, TextSize = 12,
+            BorderSizePixel = 0}, p)
+        new("UICorner", {CornerRadius = UDim.new(0, 5)}, b)
+        return b
+    end
+    local nameBox = box("Имя модели", UDim2.fromOffset(0, 160), UDim2.new(0.5, -3, 0, 24))
+    local idBox = box("ID модели", UDim2.new(0.5, 3, 0, 160), UDim2.new(0.5, -3, 0, 24))
+    btn(p, "Добавить / привязать ID", function() addById(nameBox.Text, idBox.Text) end,
+        {Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 188)})
+
+    local list = scroller(p, 218)
+    rebuildLibList = function()
+        for _, c in ipairs(list:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
+        end
+        for i, e in ipairs(LIB) do
+            local tag = e.kind == "capture" and " [копия]" or (e.id and (" [ID " .. e.id .. "]") or " [нет ID]")
+            local marks = (e == S.selfEntry and " • я" or "") .. (e == S.allEntry and " • все" or "")
+            local row = btn(list, "  " .. e.name .. tag .. marks, function()
+                libSel = e
+                if e.kind == "asset" then
+                    nameBox.Text = e.name
+                    idBox.Text = e.id and tostring(e.id) or ""
+                end
+                if e.kind == "asset" and not e.id then
+                    status("Введи ID модели справа и нажми «Добавить / привязать ID»")
+                else
+                    status("Выбрано: " .. e.name)
+                end
+                rebuildLibList()
+            end, {Size = UDim2.new(1, 0, 0, 24), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = i})
+            row.BackgroundColor3 = (e == libSel) and Color3.fromRGB(80, 105, 220) or BTN
+        end
+    end
+end
+
 -- Вкладка Клавиши
 do
     local lines = {}
@@ -1002,6 +1742,12 @@ refreshButtons = function()
     mark(B.hide, S.hidden)
     mark(B.night, S.timeLock and S.night)
     mark(B.god, S.god)
+    mark(B.hideNPC, S.hideNPC)
+    mark(B.swap, S.swap)
+    mark(B.listPlayers, S.listPlayers)
+    B.hideNPC.Text = "Скрыть NPC: " .. (S.hideNPC and "ВКЛ" or "ВЫКЛ")
+    B.swap.Text = "Игроки = NPC: " .. (S.swap and "ВКЛ" or "ВЫКЛ")
+    B.listPlayers.Text = "Игроки в списке: " .. (S.listPlayers and "ДА" or "НЕТ")
     B.smooth.Text = "Плавно: " .. (S.smooth and "ВКЛ" or "ВЫКЛ")
     B.markers.Text = "Маркеры: " .. (S.markers and "ВКЛ" or "ВЫКЛ")
     B.hideSelf.Text = "Скрывать и себя: " .. (S.hideSelf and "ДА" or "НЕТ")
@@ -1012,9 +1758,24 @@ end
 ---------------------------------------------------------------------
 -- Фоновые задачи
 ---------------------------------------------------------------------
-local acc = 0
+local acc, acc2, acc3 = 0, 0, 0
 connect(RunService.Heartbeat, function(dt)
     acc = acc + dt
+    acc2 = acc2 + dt
+    acc3 = acc3 + dt
+    if acc2 >= 1 then
+        acc2 = 0
+        if S.selfEntry or S.allEntry or S.swap or next(skins) then reconcileAsync() end
+    end
+    if acc3 >= 2 then
+        acc3 = 0
+        if S.hideNPC then updateNPCHide() end
+    end
+    for _, rec in pairs(VH) do
+        for d, info in pairs(rec.orig) do
+            if d.Parent and d[info[1]] ~= info[2] then d[info[1]] = info[2] end
+        end
+    end
     if acc >= 3 then
         acc = 0
         if gui.Enabled and pages["NPC"].Visible then
@@ -1035,6 +1796,14 @@ genv.__CinePanelCleanup = function()
     S.timeLock = false
     clearHide()
     toggleGod(false)
+    S.selfEntry, S.allEntry, S.swap, S.hideNPC = nil, nil, false, false
+    for ch in pairs(skins) do removeSkin(ch) end
+    vhClearAll()
+    for _, t in ipairs(swapTemplates) do
+        if t.src then pcall(function() t.src:Destroy() end) end
+    end
+    pcall(function() RunService:UnbindFromRenderStep("CineSkins") end)
+    if skinFolder then skinFolder:Destroy() end
     if markerFolder then markerFolder:Destroy() end
     pcall(function() RunService:UnbindFromRenderStep("CinePanel") end)
     for _, c in ipairs(conns) do c:Disconnect() end
@@ -1043,6 +1812,8 @@ genv.__CinePanelCleanup = function()
 end
 
 loadCams()
+loadLib()
+rebuildLibList()
 scanNPCs()
 rebuildNPCList()
 rebuildCamList()
