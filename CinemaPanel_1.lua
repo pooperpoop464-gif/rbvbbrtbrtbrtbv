@@ -823,8 +823,8 @@ local function deserialize(desc)
                 sm.MeshId = e.mid
                 sm.TextureId = e.tid or ""
                 local ms = e.msz or {1, 1, 1}
-                sm.Scale = Vector3.new(e.sz[1] / math.max(ms[1], 1e-3), e.sz[2] / math.max(ms[2], 1e-3),
-                    e.sz[3] / math.max(ms[3], 1e-3))
+                local function sc(a, b) return (b and b > 0.001) and (a / b) or 1 end
+                sm.Scale = Vector3.new(sc(e.sz[1], ms[1]), sc(e.sz[2], ms[2]), sc(e.sz[3], ms[3]))
                 sm.Parent = p
             end
         end
@@ -1075,6 +1075,54 @@ local function setupTracks(skin, entry)
     return any and tracks or nil
 end
 
+local ContentProvider = game:GetService("ContentProvider")
+local function digits(x) return tostring(x):match("%d+") end
+
+-- если меш закрыт для этой игры, показываем блок того же размера и цвета
+local function patchFailedMeshes(skin, label)
+    task.spawn(function()
+        local total, failed, pending = 0, 0, 0
+        for _, d in ipairs(skin:GetDescendants()) do
+            if (d:IsA("MeshPart") or d:IsA("SpecialMesh")) and d.MeshId ~= "" then
+                total = total + 1
+                pending = pending + 1
+                task.spawn(function()
+                    local bad = false
+                    local want = digits(d.MeshId)
+                    pcall(function()
+                        ContentProvider:PreloadAsync({d}, function(id, st)
+                            if digits(id) == want and (st == Enum.AssetFetchStatus.Failure
+                                or st == Enum.AssetFetchStatus.TimedOut) then
+                                bad = true
+                            end
+                        end)
+                    end)
+                    local part = d:IsA("MeshPart") and d or d.Parent
+                    if bad and part and part.Parent and not part:FindFirstChild("CinePlaceholder") then
+                        failed = failed + 1
+                        local box = Instance.new("BoxHandleAdornment")
+                        box.Name = "CinePlaceholder"
+                        box.Adornee = part
+                        box.Size = part.Size
+                        box.Color3 = part.Color
+                        box.ZIndex = 0
+                        box.AlwaysOnTop = false
+                        box.Transparency = 0
+                        box.Parent = part
+                    end
+                    pending = pending - 1
+                end)
+            end
+        end
+        local t0 = os.clock()
+        while pending > 0 and os.clock() - t0 < 15 do task.wait(0.2) end
+        if total > 0 then
+            status("«" .. label .. "»: мешей " .. total .. ", не загрузилось " .. failed
+                .. (failed > 0 and " (показаны блоками: ассеты закрыты для этой игры)" or ""))
+        end
+    end)
+end
+
 local function applySkin(char, src, entry)
     removeSkin(char)
     local origRoot = char:FindFirstChild("HumanoidRootPart") or rootOf(char)
@@ -1084,6 +1132,9 @@ local function applySkin(char, src, entry)
     skin.Name = "CineSkin"
     root.CFrame = origRoot.CFrame
     skin.Parent = getSkinFolder()
+    if entry and (entry.kind == "capture" or entry.kind == "asset") then
+        patchFailedMeshes(skin, entry.name)
+    end
     for _, d in ipairs(skin:GetDescendants()) do
         pcall(function()
             if d:IsA("BasePart") and d ~= root and d.AssemblyRootPart ~= root.AssemblyRootPart then
