@@ -41,6 +41,10 @@ local KEYS = {
     HideNPCs    = K.Delete,
     PlayersAsNPC = K.End,
     CaptureNPC  = K.Home,
+    KillFront   = K.X,
+    KillNearest = K.Insert,
+    KillSelected = K.PageDown,
+    ReviveAll   = K.PageUp,
     Exit        = K.Backspace,
 }
 
@@ -62,6 +66,10 @@ local KEY_LABELS = {
     {"HideNPCs", "Скрыть всех NPC (выбранный виден)"},
     {"PlayersAsNPC", "Игроки = модели NPC"},
     {"CaptureNPC", "Скопировать выбранного NPC"},
+    {"KillFront", "KILL: убить того, кто перед тобой"},
+    {"KillNearest", "Визуально убить ближайшего"},
+    {"KillSelected", "Визуально убить выбранного"},
+    {"ReviveAll", "Вернуть всех"},
     {"Exit", "Выйти из всех режимов"},
 }
 
@@ -573,6 +581,7 @@ end
 ---------------------------------------------------------------------
 -- Слоты библиотеки: вставьте ID модели в панели (вкладка «Модели»)
 local PRESETS = {"Huggy Wuggy", "Kissy Missy", "Mommy Long Legs", "CatNap"}
+local ARM_DOWN = 1.4   -- насколько (рад.) опускать руки R15, если у источника нет позы/анимации
 local LIB_FILE = "CinePanel_library.json"
 local LIB, libSel = {}, nil
 local rebuildLibList = function() end
@@ -682,6 +691,35 @@ local function loadAssetModel(id)
     return rig
 end
 
+-- анимации модели: из скрипта Animate (idle/walk/run)
+local function readAnimIds(model)
+    local out = {}
+    local an = model:FindFirstChild("Animate")
+    if an then
+        for _, key in ipairs({"idle", "walk", "run"}) do
+            local f = an:FindFirstChild(key)
+            local a = f and f:FindFirstChildWhichIsA("Animation", true)
+            if a and a.AnimationId ~= "" then out[key] = a.AnimationId end
+        end
+    end
+    return out
+end
+
+-- какие анимации сейчас реально играют у модели (для NPC без Animate)
+local function livePlayingIds(model)
+    local host = model:FindFirstChildOfClass("Humanoid") or model:FindFirstChildOfClass("AnimationController")
+    local animator = host and host:FindFirstChildOfClass("Animator")
+    local ids = {}
+    if animator then
+        for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+            if tr.Animation and tr.Animation.AnimationId ~= "" and tr.WeightCurrent > 0.3 then
+                table.insert(ids, tr.Animation.AnimationId)
+            end
+        end
+    end
+    return ids
+end
+
 local function enumByValue(enum, v)
     for _, it in ipairs(enum:GetEnumItems()) do
         if it.Value == v then return it end
@@ -721,6 +759,10 @@ local function serialize(model)
                     e.sm = {t = c.MeshType.Value, id = c.MeshId, tx = c.TextureId, sc = v3(c.Scale), of = v3(c.Offset)}
                 elseif c:IsA("SurfaceAppearance") then
                     e.sa = {c = c.ColorMap, n = c.NormalMap, m = c.MetalnessMap, r = c.RoughnessMap}
+                elseif c:IsA("Texture") then
+                    e.tx = e.tx or {}
+                    table.insert(e.tx, {t = c.Texture, f = c.Face.Value, u = c.StudsPerTileU, v = c.StudsPerTileV,
+                        tr = origVal(model, c, "Transparency")})
                 elseif c:IsA("Decal") then
                     e.dc = e.dc or {}
                     table.insert(e.dc, {t = c.Texture, f = c.Face.Value, tr = origVal(model, c, "Transparency")})
@@ -740,7 +782,22 @@ local function serialize(model)
         end
     end
     local hum = model:FindFirstChildOfClass("Humanoid")
-    return {name = model.Name, root = idx[root], parts = parts, joints = joints, hip = hum and hum.HipHeight or 0}
+    local clo = {}
+    local function col(x) return {x.R, x.G, x.B} end
+    for _, c in ipairs(model:GetChildren()) do
+        if c:IsA("Shirt") then clo.shirt = c.ShirtTemplate
+        elseif c:IsA("Pants") then clo.pants = c.PantsTemplate
+        elseif c:IsA("ShirtGraphic") then clo.gr = c.Graphic
+        elseif c:IsA("BodyColors") then
+            clo.bc = {col(c.HeadColor3), col(c.TorsoColor3), col(c.LeftArmColor3), col(c.RightArmColor3),
+                col(c.LeftLegColor3), col(c.RightLegColor3)}
+        elseif c:IsA("CharacterMesh") then
+            clo.cm = clo.cm or {}
+            table.insert(clo.cm, {b = c.BodyPart.Value, m = c.MeshId, o = c.OverlayTextureId, t = c.BaseTextureId})
+        end
+    end
+    return {name = model.Name, root = idx[root], parts = parts, joints = joints, hip = hum and hum.HipHeight or 0,
+        rig = hum and hum.RigType.Value or 1, clo = clo, anim = readAnimIds(model)}
 end
 
 -- сборка модели из описания (работает в другой игре, если ассеты доступны)
@@ -798,6 +855,14 @@ local function deserialize(desc)
             dc.Transparency = dd.tr or 0
             dc.Parent = p
         end
+        for _, tt in ipairs(e.tx or {}) do
+            local tx = Instance.new("Texture")
+            tx.Texture = tt.t
+            tx.Face = enumByValue(Enum.NormalId, tt.f) or Enum.NormalId.Front
+            tx.StudsPerTileU, tx.StudsPerTileV = tt.u or 2, tt.v or 2
+            tx.Transparency = tt.tr or 0
+            tx.Parent = p
+        end
         if e.sa and p:IsA("MeshPart") then
             pcall(function()
                 local sa = Instance.new("SurfaceAppearance")
@@ -837,6 +902,31 @@ local function deserialize(desc)
             w.Parent = p
         end
     end
+    local hum = Instance.new("Humanoid")
+    pcall(function() hum.RigType = enumByValue(Enum.HumanoidRigType, desc.rig or 1) or Enum.HumanoidRigType.R15 end)
+    hum.HipHeight = desc.hip or 0
+    hum.Parent = model
+    Instance.new("Animator", hum)
+    local clo = desc.clo or {}
+    if clo.shirt then local sh = Instance.new("Shirt") sh.ShirtTemplate = clo.shirt sh.Parent = model end
+    if clo.pants then local pa = Instance.new("Pants") pa.PantsTemplate = clo.pants pa.Parent = model end
+    if clo.gr then local g = Instance.new("ShirtGraphic") g.Graphic = clo.gr g.Parent = model end
+    if clo.bc then
+        local function c3(t) return Color3.new(t[1], t[2], t[3]) end
+        local b = Instance.new("BodyColors")
+        b.HeadColor3, b.TorsoColor3 = c3(clo.bc[1]), c3(clo.bc[2])
+        b.LeftArmColor3, b.RightArmColor3 = c3(clo.bc[3]), c3(clo.bc[4])
+        b.LeftLegColor3, b.RightLegColor3 = c3(clo.bc[5]), c3(clo.bc[6])
+        b.Parent = model
+    end
+    for _, m in ipairs(clo.cm or {}) do
+        pcall(function()
+            local cm = Instance.new("CharacterMesh")
+            cm.BodyPart = enumByValue(Enum.BodyPart, m.b)
+            cm.MeshId, cm.OverlayTextureId, cm.BaseTextureId = m.m, m.o, m.t
+            cm.Parent = model
+        end)
+    end
     model:SetAttribute("CineHip", desc.hip or 0)
     return model
 end
@@ -863,7 +953,7 @@ local function loadLib()
             local ok, t = pcall(function() return HttpService:JSONDecode(readfile(LIB_FILE)) end)
             if ok and type(t) == "table" then
                 for _, e in ipairs(t) do
-                    table.insert(LIB, {name = e.n, kind = e.k, id = e.id, desc = e.d})
+                    table.insert(LIB, {name = e.n, kind = e.k, id = e.id, desc = e.d, anim = e.d and e.d.anim or nil})
                 end
             end
         end
@@ -895,6 +985,10 @@ local function getSource(entry)
     if src then
         entry.src = src
         entry.failT = nil
+        if not entry.anim or next(entry.anim) == nil then
+            local a = readAnimIds(src)
+            if next(a) then entry.anim = a end
+        end
     else
         entry.failT = os.clock()
         status("Не удалось загрузить: " .. entry.name)
@@ -950,6 +1044,37 @@ local function buildSkin(src)
     return skin, root, hip
 end
 
+local function isIdentity(cf)
+    return cf.RightVector:Dot(Vector3.xAxis) > 0.999 and cf.UpVector:Dot(Vector3.yAxis) > 0.999
+end
+
+-- проигрывание сохранённых анимаций (idle/walk/run) на скине
+local function setupTracks(skin, entry)
+    local anim = entry and entry.anim
+    if not anim or next(anim) == nil then return nil end
+    local host = skin:FindFirstChildOfClass("Humanoid") or skin:FindFirstChildOfClass("AnimationController")
+    if not host then
+        host = Instance.new("AnimationController")
+        host.Parent = skin
+    end
+    local animator = host:FindFirstChildOfClass("Animator") or Instance.new("Animator", host)
+    local tracks, any = {}, false
+    for _, key in ipairs({"idle", "walk", "run"}) do
+        local id = anim[key]
+        if id then
+            local a = Instance.new("Animation")
+            a.AnimationId = id
+            local ok, tr = pcall(function() return animator:LoadAnimation(a) end)
+            if ok and tr then
+                tr.Looped = true
+                tracks[key] = tr
+                any = true
+            end
+        end
+    end
+    return any and tracks or nil
+end
+
 local function applySkin(char, src, entry)
     removeSkin(char)
     local origRoot = char:FindFirstChild("HumanoidRootPart") or rootOf(char)
@@ -976,12 +1101,16 @@ local function applySkin(char, src, entry)
         if d:IsA("Motor6D") then origMotors[d.Name] = d end
     end
     for _, d in ipairs(skin:GetDescendants()) do
-        if d:IsA("Motor6D") and origMotors[d.Name] then
-            pairsList[#pairsList + 1] = {d, origMotors[d.Name]}
+        if d:IsA("Motor6D") then
+            local o = origMotors[d.Name]
+            local sg = (d.Name == "RightShoulder" and -1) or (d.Name == "LeftShoulder" and 1) or nil
+            if o or sg then pairsList[#pairsList + 1] = {d, o, sg} end
         end
     end
+    local tracks = setupTracks(skin, entry)
     vhHide(char, "skin")
-    skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY, motors = pairsList,
+    skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY,
+        motors = tracks and {} or pairsList, fb = pairsList, tracks = tracks, t0 = os.clock(),
         isPlayer = Players:GetPlayerFromCharacter(char) ~= nil, entry = entry, parked = false}
     return true
 end
@@ -992,10 +1121,49 @@ RunService:BindToRenderStep("CineSkins", Enum.RenderPriority.Last.Value, functio
             removeSkin(char)
         else
             e.root.CFrame = e.origRoot.CFrame * CFrame.new(0, e.offY, 0)
-            for _, pr in ipairs(e.motors) do
-                if pr[1].Parent and pr[2].Parent then pr[1].Transform = pr[2].Transform end
+            if e.tracks then
+                if os.clock() - e.t0 > 3 then -- анимации не загрузились -> копируем позу
+                    local ok = false
+                    for _, tr in pairs(e.tracks) do
+                        if tr.Length > 0 then ok = true end
+                    end
+                    if not ok then e.tracks, e.motors = nil, e.fb end
+                end
             end
-            local park = (S.hidden and e.isPlayer and (char ~= lp.Character or S.hideSelf)) and true or false
+            if e.tracks then
+                local v = e.origRoot.AssemblyLinearVelocity
+                local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+                local want = "idle"
+                if sp > 1 then
+                    if sp > 18 and e.tracks.run then want = "run"
+                    elseif e.tracks.walk then want = "walk"
+                    elseif e.tracks.run then want = "run" end
+                end
+                if not e.tracks[want] then want = e.tracks.idle and "idle" or nil end
+                if want ~= e.state then
+                    for k, tr in pairs(e.tracks) do
+                        if k ~= want and tr.IsPlaying then tr:Stop(0.2) end
+                    end
+                    if want then e.tracks[want]:Play(0.2) end
+                    e.state = want
+                end
+                if want and want ~= "idle" then
+                    pcall(function() e.tracks[want]:AdjustSpeed(math.clamp(sp / 14, 0.4, 2.5)) end)
+                end
+            else
+                for _, pr in ipairs(e.motors) do
+                    local m, o, sg = pr[1], pr[2], pr[3]
+                    if m.Parent then
+                        local t = o and o.Parent and o.Transform
+                        if sg and (not t or isIdentity(t)) then
+                            m.Transform = CFrame.Angles(0, 0, sg * ARM_DOWN) -- руки вниз
+                        elseif t then
+                            m.Transform = t
+                        end
+                    end
+                end
+            end
+            local park = (e.dead or (S.hidden and e.isPlayer and (char ~= lp.Character or S.hideSelf))) and true or false
             if park ~= e.parked then
                 e.parked = park
                 e.skin.Parent = park and nil or getSkinFolder()
@@ -1093,7 +1261,7 @@ local function buildTemplates()
                 local c = cloneModel(m)
                 if c then
                     byName[m.Name] = true
-                    table.insert(swapTemplates, {name = m.Name, kind = "template", src = c})
+                    table.insert(swapTemplates, {name = m.Name, kind = "template", src = c, anim = readAnimIds(m)})
                 end
             end
         end
@@ -1185,6 +1353,34 @@ local function deleteSel()
     status("Удалено: " .. e.name)
 end
 
+-- запоминает анимации NPC (idle/walk/run), наблюдая за ним несколько секунд
+local function observeAnims(model, entry, duration)
+    task.spawn(function()
+        local t0 = os.clock()
+        entry.anim = entry.anim or {}
+        while os.clock() - t0 < duration and model.Parent do
+            local r = rootOf(model)
+            if r then
+                local v = r.AssemblyLinearVelocity
+                local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+                local key = sp > 14 and "run" or (sp > 1 and "walk" or "idle")
+                if not entry.anim[key] then
+                    for _, id in ipairs(livePlayingIds(model)) do
+                        local used = false
+                        for k2, v2 in pairs(entry.anim) do
+                            if v2 == id then used = true end
+                        end
+                        if not used then entry.anim[key] = id break end
+                    end
+                end
+            end
+            task.wait(0.3)
+        end
+        if entry.desc then entry.desc.anim = entry.anim end
+        saveLib()
+    end)
+end
+
 local function captureNPC()
     local m = S.target
     if not (m and m.Parent) then
@@ -1206,11 +1402,15 @@ local function captureNPC()
         name = base .. " #" .. n
     end
     local entry = {name = name, kind = "capture", src = src, desc = ok and desc or nil}
+    entry.anim = readAnimIds(m)
+    if entry.desc then entry.desc.anim = entry.anim end
+    observeAnims(m, entry, 20)
     table.insert(LIB, entry)
     libSel = entry
     saveLib()
     rebuildLibList()
-    status("Скопировано: " .. name .. (entry.desc and (writefile and " (сохранено в файл)" or "") or " (только в этой сессии)"))
+    status("Скопировано: " .. name .. (entry.desc and (writefile and " (в файл)" or "") or " (только сессия)")
+        .. ". Запоминаю анимации 20 с — пусть NPC постоит и пройдётся")
 end
 
 local function addById(nameText, idText)
@@ -1231,6 +1431,180 @@ local function addById(nameText, idText)
     saveLib()
     rebuildLibList()
     status("Добавлено: " .. name .. " (ID " .. id .. ")")
+end
+
+---------------------------------------------------------------------
+-- Визуальное «убийство» (только у вас на экране, настоящий персонаж не страдает):
+-- оригинал/скин прячется, вместо него падает рэгдолл-копия, через время всё возвращается
+---------------------------------------------------------------------
+local KILL_RESPAWN = 8      -- через сколько секунд персонаж «воскресает»
+local KILL_RANGE = 40       -- радиус поиска ближайшего (studs)
+local fxFolder
+local deadChars = {}
+
+local function reviveChar(char)
+    local d = deadChars[char]
+    if not d then return end
+    deadChars[char] = nil
+    pcall(function() d.fake:Destroy() end)
+    vhShow(char, "dead")
+    local e = skins[char]
+    if e then e.dead = false end
+end
+
+local function reviveAll()
+    for ch in pairs(deadChars) do reviveChar(ch) end
+    status("Все персонажи возвращены")
+end
+
+local function visualKill(char)
+    if not char or not char.Parent or char == lp.Character or deadChars[char] then return false end
+    local e = skins[char]
+    local fake = cloneModel(e and e.skin or char)
+    if not fake then return false end
+    fake.Name = "CineDeath"
+
+    for _, d in ipairs(fake:GetDescendants()) do
+        pcall(function()
+            if d:IsA("LuaSourceContainer") or d:IsA("Sound") or d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+                d:Destroy()
+            elseif d:IsA("BasePart") then
+                d.Anchored, d.Massless, d.CanTouch, d.CanQuery = false, false, false, false
+                d.CanCollide = d.Name ~= "HumanoidRootPart" and not (d.Parent and d.Parent:IsA("Accessory"))
+            end
+        end)
+    end
+    local hum = fake:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+            hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+            hum.BreakJointsOnDeath = false
+            hum.EvaluateStateMachine = false
+            hum.PlatformStand = true
+        end)
+    end
+
+    -- Motor6D -> BallSocket (рэгдолл)
+    for _, m in ipairs(fake:GetDescendants()) do
+        if m:IsA("Motor6D") and m.Part0 and m.Part1 then
+            pcall(function()
+                local a0, a1 = Instance.new("Attachment"), Instance.new("Attachment")
+                a0.CFrame = m.C0
+                a1.CFrame = m.Part1.CFrame:Inverse() * (m.Part0.CFrame * m.C0)
+                a0.Parent, a1.Parent = m.Part0, m.Part1
+                local bs = Instance.new("BallSocketConstraint")
+                bs.Attachment0, bs.Attachment1 = a0, a1
+                bs.LimitsEnabled, bs.TwistLimitsEnabled = true, true
+                bs.UpperAngle, bs.TwistLowerAngle, bs.TwistUpperAngle = 60, -30, 30
+                bs.Parent = m.Part0
+                local nc = Instance.new("NoCollisionConstraint")
+                nc.Part0, nc.Part1 = m.Part0, m.Part1
+                nc.Parent = m.Part0
+                m:Destroy()
+            end)
+        end
+    end
+
+    if not fxFolder or not fxFolder.Parent then
+        fxFolder = Instance.new("Folder")
+        fxFolder.Name = "CineFX"
+        fxFolder.Parent = workspace
+    end
+    fake.Parent = fxFolder
+
+    local root = fake:FindFirstChild("HumanoidRootPart") or fake.PrimaryPart or fake:FindFirstChildWhichIsA("BasePart", true)
+    if root then
+        local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        local dir = myRoot and (root.Position - myRoot.Position) or Vector3.new(0, 0, -1)
+        dir = Vector3.new(dir.X, 0, dir.Z)
+        dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, -1)
+        pcall(function() root.AssemblyLinearVelocity = dir * 25 + Vector3.new(0, 12, 0) end)
+    end
+
+    deadChars[char] = {fake = fake}
+    vhHide(char, "dead")
+    if e then e.dead = true end
+
+    local TweenService = game:GetService("TweenService")
+    task.delay(math.max(KILL_RESPAWN - 1, 1), function()
+        if deadChars[char] and deadChars[char].fake == fake then
+            for _, d in ipairs(fake:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    pcall(function() TweenService:Create(d, TweenInfo.new(1), {Transparency = 1}):Play() end)
+                end
+            end
+        end
+    end)
+    task.delay(KILL_RESPAWN, function()
+        if deadChars[char] and deadChars[char].fake == fake then reviveChar(char) end
+    end)
+    return true
+end
+
+local function killNearest()
+    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local origin = (S.mode ~= "none" or not myRoot) and getCam().CFrame.Position or myRoot.Position
+    local best, bd = nil, KILL_RANGE
+    for _, h in ipairs(workspace:GetDescendants()) do
+        if h:IsA("Humanoid") then
+            local m = h.Parent
+            if m and m:IsA("Model") and m ~= lp.Character and m.Name ~= "CineDeath"
+                and not isSkinModel(m) and not deadChars[m] and h.Health > 0 then
+                local r = rootOf(m)
+                if r then
+                    local d = (r.Position - origin).Magnitude
+                    if d < bd then best, bd = m, d end
+                end
+            end
+        end
+    end
+    if best and visualKill(best) then
+        status("Убит (визуально): " .. best.Name)
+    else
+        status("Рядом никого нет (до " .. KILL_RANGE .. " м)")
+    end
+end
+
+local KILL_FRONT_RANGE = 25   -- дальность «перед тобой» (studs)
+local KILL_FRONT_DOT = 0.6    -- ширина конуса (0.6 ≈ ±53°)
+
+local function killFront()
+    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local cf = getCam().CFrame
+    local origin = (S.mode == "none" and myRoot) and myRoot.Position or cf.Position
+    local look = cf.LookVector
+    local best, bd = nil, KILL_FRONT_RANGE
+    for _, h in ipairs(workspace:GetDescendants()) do
+        if h:IsA("Humanoid") then
+            local m = h.Parent
+            if m and m:IsA("Model") and m ~= lp.Character and m.Name ~= "CineDeath"
+                and not isSkinModel(m) and not deadChars[m] and h.Health > 0 then
+                local r = rootOf(m)
+                if r then
+                    local dir = r.Position - origin
+                    local dist = dir.Magnitude
+                    if dist > 0.1 and dist < bd and look:Dot(dir.Unit) > KILL_FRONT_DOT then
+                        best, bd = m, dist
+                    end
+                end
+            end
+        end
+    end
+    if best and visualKill(best) then
+        status("KILL: " .. best.Name)
+    else
+        status("Перед тобой никого нет")
+    end
+end
+
+local function killSelected()
+    if not (S.target and S.target.Parent) then status("Сначала выбери NPC в списке") return end
+    if visualKill(S.target) then
+        status("Убит (визуально): " .. S.target.Name)
+    else
+        status("Не удалось (уже «мёртв» или это ты)")
+    end
 end
 
 local rayParams = RaycastParams.new()
@@ -1377,6 +1751,10 @@ local ACTIONS = {
     HideNPCs = function() toggleHideNPC() end,
     PlayersAsNPC = function() toggleSwap() end,
     CaptureNPC = captureNPC,
+    KillFront = killFront,
+    KillNearest = killNearest,
+    KillSelected = killSelected,
+    ReviveAll = reviveAll,
     Exit = exitAll,
     TogglePanel = function() if gui then gui.Enabled = not gui.Enabled end end,
 }
@@ -1660,13 +2038,16 @@ end
 -- Вкладка Модели
 do
     local p = pages["Модели"]
-    local g = grid(p, 154)
+    local g = grid(p, 186)
     gbtn(g, "На себя", applySelf)
     gbtn(g, "Снять с себя", clearSelf)
     gbtn(g, "На других игроков", applyOthers)
     gbtn(g, "Снять с других", clearOthers)
     gbtn(g, "Скопировать NPC", captureNPC)
     gbtn(g, "Удалить из списка", deleteSel)
+    gbtn(g, "Убить ближайшего", killNearest)
+    gbtn(g, "Убить выбранного", killSelected)
+    gbtn(g, "Вернуть всех", reviveAll)
     B.hideNPC = gbtn(g, "", function() toggleHideNPC() end)
     B.swap = gbtn(g, "", function() toggleSwap() end)
     B.listPlayers = gbtn(g, "", function()
@@ -1684,12 +2065,12 @@ do
         new("UICorner", {CornerRadius = UDim.new(0, 5)}, b)
         return b
     end
-    local nameBox = box("Имя модели", UDim2.fromOffset(0, 160), UDim2.new(0.5, -3, 0, 24))
-    local idBox = box("ID модели", UDim2.new(0.5, 3, 0, 160), UDim2.new(0.5, -3, 0, 24))
+    local nameBox = box("Имя модели", UDim2.fromOffset(0, 192), UDim2.new(0.5, -3, 0, 24))
+    local idBox = box("ID модели", UDim2.new(0.5, 3, 0, 192), UDim2.new(0.5, -3, 0, 24))
     btn(p, "Добавить / привязать ID", function() addById(nameBox.Text, idBox.Text) end,
-        {Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 188)})
+        {Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 220)})
 
-    local list = scroller(p, 218)
+    local list = scroller(p, 250)
     rebuildLibList = function()
         for _, c in ipairs(list:GetChildren()) do
             if c:IsA("TextButton") then c:Destroy() end
@@ -1713,6 +2094,23 @@ do
             row.BackgroundColor3 = (e == libSel) and Color3.fromRGB(80, 105, 220) or BTN
         end
     end
+end
+
+-- Экранная кнопка KILL (отдельно от панели, остаётся при скрытой панели)
+local killGui = new("ScreenGui", {Name = "CineKill", ResetOnSpawn = false, DisplayOrder = 1000,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
+do
+    local ok = false
+    if gethui then ok = pcall(function() killGui.Parent = gethui() end) and killGui.Parent ~= nil end
+    if not ok then ok = pcall(function() killGui.Parent = game:GetService("CoreGui") end) and killGui.Parent ~= nil end
+    if not ok then killGui.Parent = lp:WaitForChild("PlayerGui") end
+    local kb = new("TextButton", {Text = "KILL", Size = UDim2.fromOffset(100, 50),
+        Position = UDim2.new(0.5, -50, 1, -150), BackgroundColor3 = Color3.fromRGB(190, 40, 40),
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBlack, TextSize = 22,
+        BorderSizePixel = 0}, killGui)
+    new("UICorner", {CornerRadius = UDim.new(0, 8)}, kb)
+    new("UIStroke", {Color = Color3.fromRGB(255, 255, 255), Thickness = 1.5, Transparency = 0.4}, kb)
+    kb.MouseButton1Click:Connect(killFront)
 end
 
 -- Вкладка Клавиши
@@ -1796,6 +2194,8 @@ genv.__CinePanelCleanup = function()
     S.timeLock = false
     clearHide()
     toggleGod(false)
+    reviveAll()
+    if fxFolder then fxFolder:Destroy() end
     S.selfEntry, S.allEntry, S.swap, S.hideNPC = nil, nil, false, false
     for ch in pairs(skins) do removeSkin(ch) end
     vhClearAll()
@@ -1808,6 +2208,7 @@ genv.__CinePanelCleanup = function()
     pcall(function() RunService:UnbindFromRenderStep("CinePanel") end)
     for _, c in ipairs(conns) do c:Disconnect() end
     if gui then gui:Destroy() end
+    if killGui then killGui:Destroy() end
     genv.__CinePanelCleanup = nil
 end
 
