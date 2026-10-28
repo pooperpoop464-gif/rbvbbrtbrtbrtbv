@@ -1075,6 +1075,13 @@ local function setupTracks(skin, entry)
     return any and tracks or nil
 end
 
+local diagInfo = {skin = "", mesh = ""}
+local function pushDiag()
+    local txt = diagInfo.skin .. (diagInfo.mesh ~= "" and (" | " .. diagInfo.mesh) or "")
+    status(txt)
+    print("[CinePanel] " .. txt)
+end
+
 local ContentProvider = game:GetService("ContentProvider")
 local function digits(x) return tostring(x):match("%d+") end
 
@@ -1117,20 +1124,20 @@ local function patchFailedMeshes(skin, label)
         local t0 = os.clock()
         while pending > 0 and os.clock() - t0 < 15 do task.wait(0.2) end
         if total > 0 then
-            status("«" .. label .. "»: мешей " .. total .. ", не загрузилось " .. failed
-                .. (failed > 0 and " (показаны блоками: ассеты закрыты для этой игры)" or ""))
+            diagInfo.mesh = "меши " .. total .. "/сбой " .. failed
+            pushDiag()
         end
     end)
 end
 
 local function applySkin(char, src, entry)
     removeSkin(char)
+    diagInfo.mesh = ""
     local origRoot = char:FindFirstChild("HumanoidRootPart") or rootOf(char)
     if not origRoot then return false end
     local skin, root, hip = buildSkin(src)
     if not skin then return false end
     skin.Name = "CineSkin"
-    root.CFrame = origRoot.CFrame
     skin.Parent = getSkinFolder()
     if entry and (entry.kind == "capture" or entry.kind == "asset") then
         patchFailedMeshes(skin, entry.name)
@@ -1147,6 +1154,10 @@ local function applySkin(char, src, entry)
     local origHum = char:FindFirstChildOfClass("Humanoid")
     local origHip = origHum and origHum.HipHeight or 0
     local offY = (hip + root.Size.Y / 2) - (origHip + origRoot.Size.Y / 2)
+    pcall(function()
+        skin.PrimaryPart = root
+        skin:PivotTo(origRoot.CFrame * CFrame.new(0, offY, 0))
+    end)
     local origMotors, pairsList = {}, {}
     for _, d in ipairs(char:GetDescendants()) do
         if d:IsA("Motor6D") then origMotors[d.Name] = d end
@@ -1163,6 +1174,21 @@ local function applySkin(char, src, entry)
     skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY,
         motors = tracks and {} or pairsList, fb = pairsList, tracks = tracks, t0 = os.clock(),
         isPlayer = Players:GetPlayerFromCharacter(char) ~= nil, entry = entry, parked = false}
+    task.delay(1.5, function()
+        local cur = skins[char]
+        if not cur or cur.skin ~= skin then return end
+        local n, vis, maxd = 0, 0, 0
+        for _, d in ipairs(skin:GetDescendants()) do
+            if d:IsA("BasePart") then
+                n = n + 1
+                if d.Transparency < 0.95 then vis = vis + 1 end
+                maxd = math.max(maxd, (d.Position - root.Position).Magnitude)
+            end
+        end
+        diagInfo.skin = string.format("частей %d, видно %d, разброс %.0f, сдвиг %.1f", n, vis, maxd,
+            (root.Position - origRoot.Position).Magnitude)
+        pushDiag()
+    end)
     return true
 end
 
@@ -1217,7 +1243,7 @@ RunService:BindToRenderStep("CineSkins", Enum.RenderPriority.Last.Value, functio
             local park = (e.dead or (S.hidden and e.isPlayer and (char ~= lp.Character or S.hideSelf))) and true or false
             if park ~= e.parked then
                 e.parked = park
-                e.skin.Parent = park and nil or getSkinFolder()
+                if park then e.skin.Parent = nil else e.skin.Parent = getSkinFolder() end
             end
         end
     end
