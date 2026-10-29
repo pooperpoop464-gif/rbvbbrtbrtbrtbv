@@ -42,6 +42,7 @@ local KEYS = {
     PlayersAsNPC = K.End,
     CaptureNPC  = K.Home,
     KillFront   = K.X,
+    Puppet      = K.P,
     KillNearest = K.Insert,
     KillSelected = K.PageDown,
     ReviveAll   = K.PageUp,
@@ -67,6 +68,7 @@ local KEY_LABELS = {
     {"PlayersAsNPC", "Игроки = модели NPC"},
     {"CaptureNPC", "Скопировать выбранного NPC"},
     {"KillFront", "KILL: убить NPC перед тобой"},
+    {"Puppet", "Кукла (неуязвимость от NPC)"},
     {"KillNearest", "Визуально убить ближайшего"},
     {"KillSelected", "Визуально убить выбранного"},
     {"ReviveAll", "Вернуть всех"},
@@ -115,6 +117,11 @@ local S = {
 }
 
 local npcs = {}
+local puppet = nil          -- «кукла»: локальная копия персонажа (см. togglePuppet)
+local function myRootPart()   -- корень того, кем ты сейчас управляешь
+    if puppet and puppet.root and puppet.root.Parent then return puppet.root end
+    return lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+end
 local seen = setmetatable({}, {__mode = "k"})
 local seenCounter = 0
 
@@ -273,7 +280,7 @@ local function exitAll()
     unbindSink()
     local cam = getCam()
     cam.CameraType = Enum.CameraType.Custom
-    local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+    local hum = (puppet and puppet.hum) or (lp.Character and lp.Character:FindFirstChildOfClass("Humanoid"))
     if hum then cam.CameraSubject = hum end
     cam.FieldOfView = S.origFov
     status("Режимы выключены")
@@ -590,6 +597,7 @@ end
 ---------------------------------------------------------------------
 -- Слоты библиотеки: вставьте ID модели в панели (вкладка «Модели»)
 local PRESETS = {"Huggy Wuggy", "Kissy Missy", "Mommy Long Legs", "CatNap"}
+local CLIP_FPS = 15      -- частота записи поз (кадров/с) для копирования анимаций
 local ARM_DOWN = 1.4   -- насколько (рад.) опускать руки R15, если у источника нет позы/анимации
 local LIB_FILE = "CinePanel_library.json"
 local LIB, libSel = {}, nil
@@ -826,6 +834,7 @@ local function deserialize(desc)
     local model = Instance.new("Model")
     model.Name = desc.name or "Captured"
     local parts, connected = {}, {}
+    local unsup = 0
     for i, e in ipairs(desc.parts) do
         local p
         if e.mid and e.mid ~= "" then
@@ -837,6 +846,10 @@ local function deserialize(desc)
         end
         if not p then
             local cls = (e.cls == "WedgePart" or e.cls == "CornerWedgePart") and e.cls or "Part"
+            if e.cls and e.cls ~= "Part" and e.cls ~= "WedgePart" and e.cls ~= "CornerWedgePart"
+                and not (e.mid and e.mid ~= "") then
+                unsup = unsup + 1 -- Union/Truss и т.п.: форму скопировать нельзя, будет блок
+            end
             p = Instance.new(cls)
             if e.mid and e.mid ~= "" then
                 local sm = Instance.new("SpecialMesh")
@@ -948,6 +961,7 @@ local function deserialize(desc)
             cm.Parent = model
         end)
     end
+    model:SetAttribute("CineUnsup", unsup)
     model:SetAttribute("CineHip", desc.hip or 0)
     return model
 end
@@ -960,7 +974,7 @@ local function saveLib()
         if e.kind == "capture" then
             if e.desc then t[#t + 1] = {n = e.name, k = "capture", d = e.desc} end
         else
-            t[#t + 1] = {n = e.name, k = "asset", id = e.id, an = e.anim}
+            t[#t + 1] = {n = e.name, k = "asset", id = e.id, an = e.anim, cl = e.clips}
         end
     end
     pcall(function() writefile(LIB_FILE, HttpService:JSONEncode(t)) end)
@@ -974,7 +988,7 @@ local function loadLib()
             local ok, t = pcall(function() return HttpService:JSONDecode(readfile(LIB_FILE)) end)
             if ok and type(t) == "table" then
                 for _, e in ipairs(t) do
-                    table.insert(LIB, {name = e.n, kind = e.k, id = e.id, desc = e.d, anim = (e.d and e.d.anim) or e.an})
+                    table.insert(LIB, {name = e.n, kind = e.k, id = e.id, desc = e.d, anim = (e.d and e.d.anim) or e.an, clips = (e.d and e.d.clips) or e.cl})
                 end
             end
         end
@@ -1050,14 +1064,21 @@ local function buildSkin(src)
             end
         end)
     end
-    if hum then -- humanoid оставляем (нужен для одежды), но делаем инертным
-        pcall(function()
-            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-            hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
-            hum.BreakJointsOnDeath = false
-            hum.PlatformStand = true
-            hum.EvaluateStateMachine = false
-        end)
+    if hum then
+        local clothes = skin:FindFirstChildOfClass("Shirt") or skin:FindFirstChildOfClass("Pants")
+            or skin:FindFirstChildOfClass("ShirtGraphic") or skin:FindFirstChildOfClass("BodyColors")
+            or skin:FindFirstChildOfClass("CharacterMesh")
+        if clothes then -- humanoid нужен только для одежды: делаем его инертным
+            pcall(function()
+                hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+                hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+                hum.BreakJointsOnDeath = false
+                hum.PlatformStand = true
+                hum.EvaluateStateMachine = false
+            end)
+        else
+            hum:Destroy()
+        end
     end
     local root = skin:FindFirstChild("HumanoidRootPart") or skin.PrimaryPart or skin:FindFirstChildWhichIsA("BasePart", true)
     if not root then skin:Destroy() return nil end
@@ -1188,8 +1209,8 @@ local function checkTextures(skin)
         end
         local t0 = os.clock()
         while pending > 0 and os.clock() - t0 < 15 do task.wait(0.2) end
-        diagInfo.tex = string.format("текстуры: TID %d, SA %d, декали %d, без текстуры %d, сбой %d, восст. %d",
-            tid, sa, deco, empty, failed, diagInfo.fixed)
+        diagInfo.tex = string.format("текстуры: TID %d, SA %d, декали %d, без текстуры %d, сбой %d, восст. %d, заглушек %d",
+            tid, sa, deco, empty, failed, diagInfo.fixed, skin:GetAttribute("CineUnsup") or 0)
         pushDiag()
     end)
 end
@@ -1259,7 +1280,7 @@ local function isArmJoint(m)
     return n:find("shoulder") ~= nil or n:find("arm") ~= nil
 end
 
-local function armDownTransform(m, down)
+local function armToward(m, target)
     local p0, p1 = m.Part0, m.Part1
     if not (p0 and p1) then return nil end
     local F = p0.CFrame * m.C0
@@ -1267,13 +1288,168 @@ local function armDownTransform(m, down)
     local v = (F * m.C1:Inverse()).Position - J
     if v.Magnitude < 0.05 then return nil end
     local vu = v.Unit
-    local d = vu:Dot(down)
-    if d > 0.9 then return CFrame.new() end -- уже опущена
-    local axis = vu:Cross(down)
+    local d = vu:Dot(target)
+    if d > 0.9 then return CFrame.new() end -- уже направлена туда
+    local axis = vu:Cross(target)
     if axis.Magnitude < 1e-4 then return nil end
     local ang = math.acos(math.clamp(d, -1, 1)) * 0.95
     local Tj = CFrame.new(J) * CFrame.fromAxisAngle(axis.Unit, ang) * CFrame.new(-J)
     return F:Inverse() * Tj * F
+end
+
+-- руки: {сустав, поза «вниз», поза «вперёд (удар)»}
+local function buildArms(model, root)
+    local arms = {}
+    local down = -root.CFrame.UpVector
+    local fwd = (root.CFrame.LookVector * 0.9 + root.CFrame.UpVector * 0.1).Unit
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("Motor6D") and isArmJoint(d) then
+            arms[#arms + 1] = {d, armToward(d, down), armToward(d, fwd)}
+        end
+    end
+    return arms
+end
+
+-- записанные «клипы» движения суставов (работают в любой игре, не зависят от прав на анимации)
+local function decodeClips(raw)
+    if not raw or not raw.keys then return nil end
+    local out = {keys = raw.keys, keyIndex = {}}
+    for j, k in ipairs(raw.keys) do out.keyIndex[k] = j end
+    local any = false
+    for _, st in ipairs({"idle", "walk", "run", "attack"}) do
+        local c = raw[st]
+        if c and c.f and #c.f > 1 then
+            local frames = {}
+            for fi, fr in ipairs(c.f) do
+                local row = {}
+                for j = 1, #raw.keys do
+                    local b = (j - 1) * 6
+                    row[j] = CFrame.new(fr[b + 1], fr[b + 2], fr[b + 3])
+                        * CFrame.fromEulerAnglesYXZ(fr[b + 4], fr[b + 5], fr[b + 6])
+                end
+                frames[fi] = row
+            end
+            out[st] = {n = #frames, len = #frames / CLIP_FPS, sp = c.sp, frames = frames}
+            any = true
+        end
+    end
+    return any and out or nil
+end
+
+local function entryClips(entry)
+    if not (entry and entry.clips) then return nil end
+    if entry._dec == nil then
+        local ok, r = pcall(decodeClips, entry.clips)
+        entry._dec = (ok and r) or false
+    end
+    return entry._dec or nil
+end
+
+local function buildClipMotors(model, dec)
+    local list, cnt = {}, {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("Motor6D") then
+            cnt[d.Name] = (cnt[d.Name] or 0) + 1
+            local j = dec.keyIndex[d.Name .. "#" .. cnt[d.Name]]
+            if j then list[#list + 1] = {d, j} end
+        end
+    end
+    return list
+end
+
+local function applyClip(e, c, t, loop)
+    local n = c.n
+    local pos = t * CLIP_FPS
+    local i = math.floor(pos)
+    local a = pos - i
+    local ia, ib
+    if loop then
+        ia, ib = i % n + 1, (i + 1) % n + 1
+    else
+        ia, ib = math.min(i + 1, n), math.min(i + 2, n)
+    end
+    local fa, fb = c.frames[ia], c.frames[ib]
+    for _, pr in ipairs(e.cm) do
+        local m, j = pr[1], pr[2]
+        local x, y = fa[j], fb[j]
+        if x and y and m.Parent then m.Transform = x:Lerp(y, a) end
+    end
+end
+
+-- единая логика анимации: клипы -> анимации-ассеты; true, если что-то проиграно
+local function animateActor(e, dt, sp, hint)
+    e.sm = (e.sm or sp) * 0.7 + sp * 0.3
+    if e.moving then
+        if e.sm < 1.2 and not hint then e.moving = false end   -- гистерезис: без дёрганья стоя
+    elseif e.sm > 2.5 or hint then
+        e.moving = true
+    end
+    local want = "idle"
+    if e.moving then want = (e.sm > 18) and "run" or "walk" end
+
+    local cl = e.clips
+    if cl and e.cm and #e.cm > 0 then
+        if e.atkT0 and cl.attack then
+            local t = os.clock() - e.atkT0
+            if t < cl.attack.len then
+                applyClip(e, cl.attack, t, false)
+                return true
+            end
+            e.atkT0 = nil
+        end
+        local order = (want == "run" and {"run", "walk", "idle"}) or (want == "walk" and {"walk", "run", "idle"}) or {"idle"}
+        local c
+        for _, k in ipairs(order) do
+            if cl[k] then c = cl[k] break end
+        end
+        if c then
+            local scale = 1
+            if want ~= "idle" and c.sp and c.sp > 0.5 then scale = math.clamp(e.sm / c.sp, 0.5, 2) end
+            e.ct = (e.ct or 0) + dt * scale
+            applyClip(e, c, e.ct, true)
+            return true
+        end
+    end
+
+    if e.tracks then
+        if os.clock() - e.t0 > 3 then -- ассеты анимаций не загрузились -> запасной вариант
+            local ok = false
+            for _, tr in pairs(e.tracks) do
+                if tr.Length > 0 then ok = true end
+            end
+            if not ok then e.tracks, e.motors = nil, (e.fb or {}) end
+        end
+    end
+    if e.tracks then
+        local w = want
+        if not e.tracks[w] then
+            w = (w == "run" and e.tracks.walk and "walk") or (w == "walk" and e.tracks.run and "run")
+                or (e.tracks.idle and "idle") or nil
+        end
+        if w ~= e.state then
+            for k, tr in pairs(e.tracks) do
+                if k ~= w and tr.IsPlaying then tr:Stop(0.2) end
+            end
+            if w then e.tracks[w]:Play(0.2) end
+            e.state = w
+        end
+        if w and w ~= "idle" then
+            pcall(function() e.tracks[w]:AdjustSpeed(math.clamp(e.sm / 14, 0.4, 2.5)) end)
+        end
+        return true
+    end
+    return false
+end
+
+-- запасной «удар» руками, если анимации атаки нет
+local function applyFakeAttack(e)
+    local u = (os.clock() - e.fakeAtk) / 0.7
+    if u >= 1 then e.fakeAtk = nil return end
+    local s = math.sin(math.pi * u)
+    for _, a in ipairs(e.arms or {}) do
+        local m, down, fwd = a[1], a[2], a[3]
+        if m.Parent and fwd then m.Transform = (down or CFrame.new()):Lerp(fwd, s) end
+    end
 end
 
 local function applySkin(char, src, entry)
@@ -1310,17 +1486,22 @@ local function applySkin(char, src, entry)
     for _, d in ipairs(char:GetDescendants()) do
         if d:IsA("Motor6D") then origMotors[d.Name] = d end
     end
+    local arms = buildArms(skin, root)
+    local armDown = {}
+    for _, a in ipairs(arms) do armDown[a[1]] = a[2] end
     for _, d in ipairs(skin:GetDescendants()) do
         if d:IsA("Motor6D") then
             local o = origMotors[d.Name]
-            local sg = isArmJoint(d) and armDownTransform(d, -root.CFrame.UpVector) or nil
+            local sg = armDown[d]
             if o or sg then pairsList[#pairsList + 1] = {d, o, sg} end
         end
     end
     local tracks, attackTr = setupTracks(skin, entry)
+    local dec = entryClips(entry)
     vhHide(char, "skin")
     skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY,
-        motors = tracks and {} or pairsList, fb = pairsList, tracks = tracks, attack = attackTr, t0 = os.clock(),
+        motors = pairsList, fb = pairsList, tracks = tracks, attack = attackTr, t0 = os.clock(),
+        clips = dec, cm = dec and buildClipMotors(skin, dec) or {}, arms = arms,
         isPlayer = Players:GetPlayerFromCharacter(char) ~= nil, entry = entry, parked = false}
     task.delay(1.5, function()
         local cur = skins[char]
@@ -1340,54 +1521,35 @@ local function applySkin(char, src, entry)
     return true
 end
 
-RunService:BindToRenderStep("CineSkins", Enum.RenderPriority.Last.Value, function()
+local stopPuppet = function() end
+
+RunService:BindToRenderStep("CineSkins", Enum.RenderPriority.Last.Value, function(dt)
     for char, e in pairs(skins) do
         if not char.Parent or not e.origRoot.Parent then
             removeSkin(char)
         else
-            e.root.CFrame = e.origRoot.CFrame * CFrame.new(0, e.offY, 0)
-            if e.tracks then
-                if os.clock() - e.t0 > 3 then -- анимации не загрузились -> копируем позу
-                    local ok = false
-                    for _, tr in pairs(e.tracks) do
-                        if tr.Length > 0 then ok = true end
-                    end
-                    if not ok then e.tracks, e.motors = nil, e.fb end
-                end
-            end
-            if e.tracks then
-                local v = e.origRoot.AssemblyLinearVelocity
-                local sp = Vector3.new(v.X, 0, v.Z).Magnitude
-                local want = "idle"
-                if sp > 1 then
-                    if sp > 18 and e.tracks.run then want = "run"
-                    elseif e.tracks.walk then want = "walk"
-                    elseif e.tracks.run then want = "run" end
-                end
-                if not e.tracks[want] then want = e.tracks.idle and "idle" or nil end
-                if want ~= e.state then
-                    for k, tr in pairs(e.tracks) do
-                        if k ~= want and tr.IsPlaying then tr:Stop(0.2) end
-                    end
-                    if want then e.tracks[want]:Play(0.2) end
-                    e.state = want
-                end
-                if want and want ~= "idle" then
-                    pcall(function() e.tracks[want]:AdjustSpeed(math.clamp(sp / 14, 0.4, 2.5)) end)
-                end
-            elseif not (e.attack and e.attack.IsPlaying) then
-                for _, pr in ipairs(e.motors) do
-                    local m, o, sg = pr[1], pr[2], pr[3]
-                    if m.Parent then
-                        local t = o and o.Parent and o.Transform
-                        if sg and (not t or isIdentity(t)) then
-                            m.Transform = sg -- руки вниз
-                        elseif t then
-                            m.Transform = t
+            -- весь скин двигается целиком (без отставания частей -> нет дрожи)
+            pcall(function() e.skin:PivotTo(e.origRoot.CFrame * CFrame.new(0, e.offY, 0)) end)
+            local v = e.origRoot.AssemblyLinearVelocity
+            local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local hint = char == lp.Character and hum and hum.MoveDirection.Magnitude > 0.05 or false
+            if not animateActor(e, dt, sp, hint) then
+                if not (e.attack and e.attack.IsPlaying) then
+                    for _, pr in ipairs(e.motors) do
+                        local m, o, sg = pr[1], pr[2], pr[3]
+                        if m.Parent then
+                            local t = o and o.Parent and o.Transform
+                            if sg and (not t or isIdentity(t)) then
+                                m.Transform = sg -- руки вниз
+                            elseif t then
+                                m.Transform = t
+                            end
                         end
                     end
                 end
             end
+            if e.fakeAtk then applyFakeAttack(e) end
             local park = (e.dead or (S.hidden and e.isPlayer and (char ~= lp.Character or S.hideSelf))) and true or false
             if park ~= e.parked then
                 e.parked = park
@@ -1395,11 +1557,37 @@ RunService:BindToRenderStep("CineSkins", Enum.RenderPriority.Last.Value, functio
             end
         end
     end
+
+    -- кукла: локальная копия, которой ты управляешь
+    local pp = puppet
+    if pp then
+        if not (pp.model.Parent and pp.hum.Parent and pp.root.Parent and lp.Character and pp.realRoot.Parent) then
+            stopPuppet()
+        else
+            if S.mode == "none" then
+                local cam = getCam()
+                if cam.CameraSubject ~= pp.hum then cam.CameraSubject = pp.hum end
+                if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+            end
+            local v = pp.root.AssemblyLinearVelocity
+            local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+            local e = pp.e
+            if not animateActor(e, dt, sp, pp.hum.MoveDirection.Magnitude > 0.05) then
+                for _, a in ipairs(e.arms or {}) do
+                    if a[1].Parent and a[2] then a[1].Transform = a[2] end
+                end
+            end
+            if e.fakeAtk then applyFakeAttack(e) end
+        end
+    end
 end)
 
 -- какую модель получает игрок
 local function desiredFor(p)
-    if p == lp then return S.selfEntry end
+    if p == lp then
+        if puppet then return nil end
+        return S.selfEntry
+    end
     if S.allEntry then return S.allEntry end
     if S.swap and #swapTemplates > 0 then
         return swapTemplates[(p.UserId % #swapTemplates) + 1]
@@ -1578,42 +1766,113 @@ local function deleteSel()
     status("Удалено: " .. e.name)
 end
 
--- запоминает анимации NPC: idle/walk/run и attack (не зацикленные или с «attack/kill/grab…» в имени)
+-- записывает анимации NPC: ID (если доступны) и «клипы» движения суставов (работают в любой игре)
 local function observeAnims(model, entry, duration)
     task.spawn(function()
-        local t0 = os.clock()
         entry.anim = entry.anim or {}
+        local keys, motors, cnt = {}, {}, {}
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("Motor6D") then
+                cnt[d.Name] = (cnt[d.Name] or 0) + 1
+                keys[#keys + 1] = d.Name .. "#" .. cnt[d.Name]
+                motors[#motors + 1] = d
+            end
+        end
+        local function r3(x) return math.floor(x * 1000 + 0.5) / 1000 end
+        local function sample()
+            local fr = {}
+            for _, m in ipairs(motors) do
+                local cf = m.Transform
+                local ps = cf.Position
+                local rx, ry, rz = cf:ToEulerAnglesYXZ()
+                local n = #fr
+                fr[n + 1], fr[n + 2], fr[n + 3] = r3(ps.X), r3(ps.Y), r3(ps.Z)
+                fr[n + 4], fr[n + 5], fr[n + 6] = r3(rx), r3(ry), r3(rz)
+            end
+            return fr
+        end
+        local LIM = {idle = 3, walk = 2.4, run = 2, attack = 3.5}
+        local rec, prev, smooth, moving = {}, nil, 0, false
+        local t0 = os.clock()
         while os.clock() - t0 < duration and model.Parent do
             local r = rootOf(model)
             if r then
                 local v = r.AssemblyLinearVelocity
                 local sp = Vector3.new(v.X, 0, v.Z).Magnitude
-                local key = sp > 14 and "run" or (sp > 1 and "walk" or "idle")
+                smooth = smooth * 0.6 + sp * 0.4
+                if moving then
+                    if smooth < 1.2 then moving = false end
+                elseif smooth > 2.5 then
+                    moving = true
+                end
+                local isAtk = false
+                local key = moving and (smooth > 14 and "run" or "walk") or "idle"
                 for _, t in ipairs(livePlayingIds(model)) do
+                    local nm = string.lower(t.name or "")
+                    local atk = (not t.looped) or nm:find("attack") or nm:find("kill") or nm:find("grab")
+                        or nm:find("slash") or nm:find("bite") or nm:find("hit") or nm:find("swing")
+                    if atk then isAtk = true end
                     local known = false
                     for _, v2 in pairs(entry.anim) do
                         if v2 == t.id then known = true end
                     end
                     if not known then
-                        local nm = string.lower(t.name or "")
-                        local isAtk = (not t.looped) or nm:find("attack") or nm:find("kill") or nm:find("grab")
-                            or nm:find("slash") or nm:find("bite") or nm:find("hit") or nm:find("swing")
-                        if isAtk then
+                        if atk then
                             if not entry.anim.attack then entry.anim.attack = t.id end
                         elseif not entry.anim[key] then
                             entry.anim[key] = t.id
                         end
                     end
                 end
+                if #motors > 0 then
+                    local state = isAtk and "attack" or key
+                    if state ~= prev then
+                        local pc = prev and rec[prev]
+                        if pc and not pc.closed then
+                            if #pc.f >= 8 then
+                                pc.closed = true
+                            else
+                                pc.f, pc.sps, pc.nsp = {}, 0, 0
+                            end
+                        end
+                        prev = state
+                    end
+                    local c = rec[state]
+                    if not c then
+                        c = {f = {}, sps = 0, nsp = 0}
+                        rec[state] = c
+                    end
+                    if not c.closed and #c.f < LIM[state] * CLIP_FPS then
+                        c.f[#c.f + 1] = sample()
+                        c.sps, c.nsp = c.sps + smooth, c.nsp + 1
+                    end
+                end
             end
-            task.wait(0.3)
+            task.wait(1 / CLIP_FPS)
+        end
+        local clips, got = {keys = keys}, {}
+        for st, c in pairs(rec) do
+            if #c.f >= 6 then
+                clips[st] = {f = c.f, sp = c.nsp > 0 and r3(c.sps / c.nsp) or 0}
+                got[#got + 1] = st
+            end
+        end
+        if #got > 0 then
+            entry.clips = clips
+            entry._dec = nil
+            if entry.desc then entry.desc.clips = clips end
         end
         if entry.desc then entry.desc.anim = entry.anim end
         saveLib()
-        local ks = {}
-        for k in pairs(entry.anim) do ks[#ks + 1] = k end
-        table.sort(ks)
-        status("Анимации записаны: " .. (#ks > 0 and table.concat(ks, ", ") or "ничего не поймано"))
+        for k in pairs(entry.anim) do
+            local f = false
+            for _, g in ipairs(got) do
+                if g == k then f = true end
+            end
+            if not f then got[#got + 1] = k .. "(id)" end
+        end
+        table.sort(got)
+        status("Записано: " .. (#got > 0 and table.concat(got, ", ") or "ничего (NPC стоял без анимаций?)"))
         if S.selfEntry == entry and lp.Character then
             removeSkin(lp.Character)
             reconcileAsync()
@@ -1630,7 +1889,7 @@ local function recordAttacks()
     e.anim = e.anim or {}
     if e.desc then e.desc.anim = e.anim end
     observeAnims(m, e, 40)
-    status("Записываю 40 с: дождись, пока NPC атакует/ходит")
+    status("Записываю 40 с: пусть NPC постоит, походит и атакует")
 end
 
 -- ручной ID анимации атаки
@@ -1786,7 +2045,7 @@ local function visualKill(char, rip)
 
     local root = fake:FindFirstChild("HumanoidRootPart") or fake.PrimaryPart or fake:FindFirstChildWhichIsA("BasePart", true)
     if root then
-        local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        local myRoot = myRootPart()
         local dir = myRoot and (root.Position - myRoot.Position) or Vector3.new(0, 0, -1)
         dir = Vector3.new(dir.X, 0, dir.Z)
         dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, -1)
@@ -1837,7 +2096,7 @@ local KILL_RIP = true            -- рвать NPC на части (true) или
 local toggleKillUI = function() end
 
 local function killNearest()
-    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local myRoot = myRootPart()
     local origin = (S.mode ~= "none" or not myRoot) and getCam().CFrame.Position or myRoot.Position
     local best, bd = nil, KILL_RANGE
     for _, h in ipairs(workspace:GetDescendants()) do
@@ -1868,7 +2127,7 @@ local killBusy = false
 local function killFront()
     if killBusy then return end
     if not S.god then toggleGod(true) end -- на время KILL персонаж неуязвим (клиентская неуязвимость)
-    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local myRoot = myRootPart()
     local cf = getCam().CFrame
     local origin = (S.mode == "none" and myRoot) and myRoot.Position or cf.Position
     local look = cf.LookVector
@@ -1898,13 +2157,21 @@ local function killFront()
             myRoot.CFrame = CFrame.lookAt(myRoot.Position, Vector3.new(tp.X, myRoot.Position.Y, tp.Z))
         end)
     end
-    local atk = false
-    local e = lp.Character and skins[lp.Character]
-    if e and e.attack then
-        pcall(function() e.attack:Play(0.1) end)
-        atk = true
+    local atk = nil
+    local e = (puppet and puppet.e) or (lp.Character and skins[lp.Character])
+    if e then
+        if e.clips and e.clips.attack and #e.cm > 0 then
+            e.atkT0 = os.clock()
+            atk = e.clips.attack.len
+        elseif e.attack then
+            pcall(function() e.attack:Play(0.1) end)
+            atk = 0.5
+        else
+            e.fakeAtk = os.clock()
+            atk = 0.4
+        end
     end
-    task.delay(atk and 0.45 or 0.15, function()
+    task.delay(atk and math.min(atk * 0.6, 0.8) or 0.15, function()
         if best.Parent and visualKill(best, KILL_RIP) then status("KILL: " .. best.Name) end
         task.wait(0.4)
         killBusy = false
@@ -1918,6 +2185,116 @@ local function killSelected()
     else
         status("Не удалось (уже «мёртв», игрок или это ты)")
     end
+end
+
+---------------------------------------------------------------------
+-- Кукла: ты управляешь ЛОКАЛЬНОЙ копией, а настоящий персонаж прячется высоко над картой.
+-- Сервер и NPC видят только настоящего персонажа, поэтому до куклы они не достают.
+---------------------------------------------------------------------
+local function startPuppet()
+    if puppet then return end
+    local char = lp.Character
+    local realRoot = char and char:FindFirstChild("HumanoidRootPart")
+    local realHum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (realRoot and realHum) then status("Нет персонажа") return end
+    local entry = S.selfEntry
+    local src = entry and getSource(entry)
+    local model = cloneModel(src or char)
+    if not model then status("Не удалось создать куклу") return end
+    local animIds = (entry and entry.anim and next(entry.anim)) and entry.anim or readAnimIds(char)
+
+    for _, d in ipairs(model:GetDescendants()) do
+        pcall(function()
+            if d:IsA("LuaSourceContainer") or d:IsA("ProximityPrompt") or d:IsA("ClickDetector")
+                or d:IsA("ForceField") or d:IsA("Sound") then
+                d:Destroy()
+            elseif d:IsA("BasePart") then
+                d.Anchored, d.CanTouch, d.CanQuery, d.Massless = false, false, false, false
+                d.CanCollide = (d.Name == "HumanoidRootPart")
+            end
+        end)
+    end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        hum = Instance.new("Humanoid")
+        hum.Parent = model
+    end
+    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+        or model:FindFirstChildWhichIsA("BasePart", true)
+    if not root then
+        model:Destroy()
+        status("У модели нет корневой части")
+        return
+    end
+    model.PrimaryPart = root
+    pcall(function()
+        hum.RequiresNeck = false
+        hum.BreakJointsOnDeath = false
+        hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+        hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+        hum.MaxHealth = 1e9
+        hum.Health = 1e9
+        hum.WalkSpeed = math.clamp(realHum.WalkSpeed, 8, 40)
+        hum.PlatformStand = false
+        hum.EvaluateStateMachine = true
+    end)
+    local origCF = realRoot.CFrame
+    model.Name = "CinePuppet"
+    model.Parent = getSkinFolder()
+    pcall(function() model:PivotTo(origCF) end)
+
+    local e = {skin = model, root = root, t0 = os.clock(), motors = {}, fb = {}}
+    e.tracks, e.attack = setupTracks(model, {anim = animIds})
+    local dec = entryClips(entry)
+    e.clips = dec
+    e.cm = dec and buildClipMotors(model, dec) or {}
+    e.arms = buildArms(model, root)
+
+    puppet = {model = model, hum = hum, root = root, e = e, realRoot = realRoot, realHum = realHum,
+        wasAnchored = realRoot.Anchored, origCF = origCF}
+    removeSkin(char) -- скин с настоящего персонажа снимаем
+    local up = workspace.StreamingEnabled and 250 or 2500
+    pcall(function()
+        realRoot.AssemblyLinearVelocity = Vector3.zero
+        realRoot.CFrame = origCF + Vector3.new(0, up, 0)
+        realRoot.Anchored = true
+    end)
+    local cam = getCam()
+    if S.mode == "none" then
+        cam.CameraType = Enum.CameraType.Custom
+        cam.CameraSubject = hum
+    end
+    status("Кукла включена: управляй копией (WASD/джойстик), настоящий персонаж спрятан")
+    refreshButtons()
+end
+
+stopPuppet = function()
+    if not puppet then return end
+    local p = puppet
+    puppet = nil
+    local cf = (p.root and p.root.Parent) and p.root.CFrame or p.origCF
+    pcall(function() p.model:Destroy() end)
+    local rr = p.realRoot
+    if rr and rr.Parent then
+        pcall(function()
+            rr.CFrame = cf + Vector3.new(0, 3, 0) -- настоящий персонаж возвращается туда, где стоит кукла
+            rr.AssemblyLinearVelocity = Vector3.zero
+            rr.Anchored = p.wasAnchored
+        end)
+    end
+    if S.mode == "none" then
+        local cam = getCam()
+        cam.CameraType = Enum.CameraType.Custom
+        if p.realHum and p.realHum.Parent then cam.CameraSubject = p.realHum end
+    end
+    status("Кукла выключена")
+    refreshButtons()
+    reconcileAsync()
+end
+
+local function togglePuppet(force)
+    if force == nil then force = not puppet end
+    if force then startPuppet() else stopPuppet() end
 end
 
 local rayParams = RaycastParams.new()
@@ -2065,6 +2442,7 @@ local ACTIONS = {
     PlayersAsNPC = function() toggleSwap() end,
     CaptureNPC = captureNPC,
     KillFront = killFront,
+    Puppet = function() togglePuppet() end,
     KillNearest = killNearest,
     KillSelected = killSelected,
     ReviveAll = reviveAll,
@@ -2328,7 +2706,7 @@ end
 -- Вкладка Мир
 do
     local p = pages["Мир"]
-    local g = grid(p, 160)
+    local g = grid(p, 192)
     B.night = gbtn(g, "День <-> Ночь", toggleDayNight)
     gbtn(g, "Сбросить время", resetTime)
     B.hide = gbtn(g, "Скрыть игроков", function() toggleHide() end)
@@ -2343,7 +2721,8 @@ do
     gbtn(g, "Скорость камеры +", function() S.speed = math.clamp(S.speed * 1.3, 2, 500) refreshButtons() end)
     B.god = gbtn(g, "Бессмертие", function() toggleGod() end)
     gbtn(g, "Вылечить себя", healSelf)
-    B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 166),
+    B.puppet = gbtn(g, "", function() togglePuppet() end)
+    B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 198),
         BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
 end
@@ -2369,7 +2748,7 @@ do
         rebuildNPCList()
         refreshButtons()
     end)
-    gbtn(g, "Записать атаки (40с)", recordAttacks)
+    gbtn(g, "Записать анимации (40с)", recordAttacks)
     B.killUI = gbtn(g, "", function() toggleKillUI() end)
     B.rip = gbtn(g, "", function() KILL_RIP = not KILL_RIP refreshButtons() end)
 
@@ -2479,9 +2858,23 @@ do
 
     -- двигаем своего персонажа (после стандартного управления, чтобы наш ввод имел приоритет)
     RunService:BindToRenderStep("CineJoy", Enum.RenderPriority.Input.Value + 1, function()
-        if joyActive and joyVec.Magnitude > 0.1 and S.mode == "none" then
-            local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
-            if hum then hum:Move(Vector3.new(joyVec.X, 0, joyVec.Y), true) end
+        if S.mode ~= "none" then return end
+        local hum = (puppet and puppet.hum) or (lp.Character and lp.Character:FindFirstChildOfClass("Humanoid"))
+        if not hum then return end
+        local vec = Vector3.zero
+        if joyActive and joyVec.Magnitude > 0.1 then vec = Vector3.new(joyVec.X, 0, joyVec.Y) end
+        if puppet then
+            if not typing() then
+                if UIS:IsKeyDown(K.W) then vec = vec + Vector3.new(0, 0, -1) end
+                if UIS:IsKeyDown(K.S) then vec = vec + Vector3.new(0, 0, 1) end
+                if UIS:IsKeyDown(K.A) then vec = vec + Vector3.new(-1, 0, 0) end
+                if UIS:IsKeyDown(K.D) then vec = vec + Vector3.new(1, 0, 0) end
+                if UIS:IsKeyDown(K.Space) then hum.Jump = true end
+            end
+            if vec.Magnitude > 1 then vec = vec.Unit end
+            hum:Move(vec, true)
+        elseif vec.Magnitude > 0 then
+            hum:Move(vec, true)
         end
     end)
 
@@ -2529,6 +2922,8 @@ refreshButtons = function()
     B.listPlayers.Text = "Игроки в списке: " .. (S.listPlayers and "ДА" or "НЕТ")
     B.killUI.Text = "KILL UI: " .. (S.killUI ~= false and "ВКЛ" or "ВЫКЛ")
     B.rip.Text = "Рвать на части: " .. (KILL_RIP and "ДА" or "НЕТ")
+    mark(B.puppet, puppet ~= nil)
+    B.puppet.Text = "Кукла (защита): " .. (puppet and "ВКЛ" or "ВЫКЛ")
     B.smooth.Text = "Плавно: " .. (S.smooth and "ВКЛ" or "ВЫКЛ")
     B.markers.Text = "Маркеры: " .. (S.markers and "ВКЛ" or "ВЫКЛ")
     B.hideSelf.Text = "Скрывать и себя: " .. (S.hideSelf and "ДА" or "НЕТ")
@@ -2577,6 +2972,7 @@ genv.__CinePanelCleanup = function()
     S.timeLock = false
     clearHide()
     toggleGod(false)
+    stopPuppet()
     reviveAll()
     if fxFolder then fxFolder:Destroy() end
     S.selfEntry, S.allEntry, S.swap, S.hideNPC = nil, nil, false, false
