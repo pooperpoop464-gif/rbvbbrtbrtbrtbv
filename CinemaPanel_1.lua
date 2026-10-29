@@ -112,7 +112,7 @@ local S = {
     hidden = false, hideSelf = false,
     night = false, timeLock = false, origTime = Lighting.ClockTime,
     god = false,
-    hideNPC = false, swap = false, listPlayers = false,
+    hideNPC = false, swap = false, listPlayers = false, basicAnim = false,
     selfEntry = nil, allEntry = nil,
 }
 
@@ -130,7 +130,7 @@ local refreshButtons = function() end
 local rebuildNPCList = function() end
 local rebuildCamList = function() end
 local updateNPCHide = function() end
-local function isSkinModel(m) return m.Parent ~= nil and m.Parent.Name == "CineSkins" end
+local function isSkinModel(m) return m.Parent ~= nil and (m.Parent.Name == "CineSkins" or m.Parent.Name == "CineFX") end
 
 ---------------------------------------------------------------------
 -- Утилиты
@@ -147,11 +147,11 @@ local function scanNPCs()
     local camPos = getCam().CFrame.Position
     local out = {}
     for _, h in ipairs(workspace:GetDescendants()) do
-        if h:IsA("Humanoid") then
+        if h:IsA("Humanoid") or h:IsA("AnimationController") then
             local m = h.Parent
             local plr = m and m:IsA("Model") and Players:GetPlayerFromCharacter(m)
             if m and m:IsA("Model") and not isSkinModel(m) and (not plr or (S.listPlayers and plr ~= lp))
-                and h.Health > 0 then
+                and (not h:IsA("Humanoid") or h.Health > 0) then
                 local r = rootOf(m)
                 if r then
                     if not seen[m] then
@@ -1297,17 +1297,55 @@ local function armToward(m, target)
     return F:Inverse() * Tj * F
 end
 
--- руки: {сустав, поза «вниз», поза «вперёд (удар)»}
+local function limbSide(m, idx)
+    local n = string.lower(m.Name .. " " .. (m.Part1 and m.Part1.Name or ""))
+    if n:find("right") then return 1 end
+    if n:find("left") then return -1 end
+    return (idx % 2 == 0) and 1 or -1
+end
+
+-- руки: {сустав, поза «вниз», поза «вперёд (удар)», сторона}
 local function buildArms(model, root)
-    local arms = {}
+    local arms, idx = {}, 0
     local down = -root.CFrame.UpVector
     local fwd = (root.CFrame.LookVector * 0.9 + root.CFrame.UpVector * 0.1).Unit
     for _, d in ipairs(model:GetDescendants()) do
         if d:IsA("Motor6D") and isArmJoint(d) then
-            arms[#arms + 1] = {d, armToward(d, down), armToward(d, fwd)}
+            idx = idx + 1
+            arms[#arms + 1] = {d, armToward(d, down), armToward(d, fwd), limbSide(d, idx)}
         end
     end
     return arms
+end
+
+local function limbKind(m)
+    if isArmJoint(m) then return "arm" end
+    local n = string.lower(m.Name .. " " .. (m.Part1 and m.Part1.Name or ""))
+    if n:find("lower") or n:find("knee") or n:find("foot") or n:find("ankle") or n:find("toe")
+        or n:find("shin") or n:find("calf") or n:find("armor") then
+        return nil
+    end
+    if n:find("hip") or n:find("thigh") or n:find("leg") then return "leg" end
+    return nil
+end
+
+-- конечности для базовой (процедурной) анимации ходьбы
+local function buildLimbs(model, root)
+    local list, cnt = {}, {arm = 0, leg = 0}
+    local axisW = root.CFrame.RightVector
+    local down = -root.CFrame.UpVector
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("Motor6D") and d.Part0 and d.Part1 then
+            local kind = limbKind(d)
+            if kind then
+                cnt[kind] = cnt[kind] + 1
+                local F = d.Part0.CFrame * d.C0
+                list[#list + 1] = {m = d, kind = kind, side = limbSide(d, cnt[kind]),
+                    axis = F:VectorToObjectSpace(axisW), base = (kind == "arm") and armToward(d, down) or nil}
+            end
+        end
+    end
+    return list
 end
 
 -- записанные «клипы» движения суставов (работают в любой игре, не зависят от прав на анимации)
@@ -1386,9 +1424,10 @@ local function animateActor(e, dt, sp, hint)
     end
     local want = "idle"
     if e.moving then want = (e.sm > 18) and "run" or "walk" end
+    local useRecorded = not (S.basicAnim and e.limbs and #e.limbs > 0)
 
     local cl = e.clips
-    if cl and e.cm and #e.cm > 0 then
+    if useRecorded and cl and e.cm and #e.cm > 0 then
         if e.atkT0 and cl.attack then
             local t = os.clock() - e.atkT0
             if t < cl.attack.len then
@@ -1420,7 +1459,7 @@ local function animateActor(e, dt, sp, hint)
             if not ok then e.tracks, e.motors = nil, (e.fb or {}) end
         end
     end
-    if e.tracks then
+    if useRecorded and e.tracks then
         local w = want
         if not e.tracks[w] then
             w = (w == "run" and e.tracks.walk and "walk") or (w == "walk" and e.tracks.run and "run")
@@ -1438,17 +1477,41 @@ local function animateActor(e, dt, sp, hint)
         end
         return true
     end
+    -- базовая анимация ходьбы: машем ногами и руками (работает для любой модели)
+    if e.limbs and #e.limbs > 0 and (e.procedural or S.basicAnim) then
+        if e.tracks then
+            for _, tr in pairs(e.tracks) do
+                if tr.IsPlaying then tr:Stop(0.1) end
+            end
+            e.state = nil
+        end
+        local target = e.moving and math.clamp(e.sm / 16, 0.35, 1) or 0
+        e.amp = (e.amp or 0) + (target - (e.amp or 0)) * math.min(dt * 8, 1)
+        e.wp = (e.wp or 0) + dt * (4 + 8 * e.amp)
+        local sn = math.sin(e.wp)
+        for _, l in ipairs(e.limbs) do
+            if l.m.Parent then
+                local sign = l.side * (l.kind == "leg" and 1 or -1)
+                local amp = (l.kind == "leg" and 0.75 or 0.55) * e.amp
+                local rot = CFrame.fromAxisAngle(l.axis, sign * amp * sn)
+                l.m.Transform = l.base and (rot * l.base) or rot
+            end
+        end
+        return true
+    end
     return false
 end
 
--- запасной «удар» руками, если анимации атаки нет
+-- удар руками (базовая анимация атаки): бьёт рука стороны e.punchSide, тело подаётся вперёд
 local function applyFakeAttack(e)
-    local u = (os.clock() - e.fakeAtk) / 0.7
+    local u = (os.clock() - e.fakeAtk) / 0.38
     if u >= 1 then e.fakeAtk = nil return end
     local s = math.sin(math.pi * u)
     for _, a in ipairs(e.arms or {}) do
-        local m, down, fwd = a[1], a[2], a[3]
-        if m.Parent and fwd then m.Transform = (down or CFrame.new()):Lerp(fwd, s) end
+        local m, down, fwd, side = a[1], a[2], a[3], a[4]
+        if m.Parent and fwd and (not side or side == (e.punchSide or 1)) then
+            m.Transform = (down or CFrame.new()):Lerp(fwd, s)
+        end
     end
 end
 
@@ -1496,12 +1559,17 @@ local function applySkin(char, src, entry)
             if o or sg then pairsList[#pairsList + 1] = {d, o, sg} end
         end
     end
+    local matched = 0
+    for _, pr in ipairs(pairsList) do
+        if pr[2] then matched = matched + 1 end
+    end
     local tracks, attackTr = setupTracks(skin, entry)
     local dec = entryClips(entry)
     vhHide(char, "skin")
     skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY,
         motors = pairsList, fb = pairsList, tracks = tracks, attack = attackTr, t0 = os.clock(),
         clips = dec, cm = dec and buildClipMotors(skin, dec) or {}, arms = arms,
+        limbs = buildLimbs(skin, root), procedural = (matched == 0),
         isPlayer = Players:GetPlayerFromCharacter(char) ~= nil, entry = entry, parked = false}
     task.delay(1.5, function()
         local cur = skins[char]
@@ -1529,7 +1597,12 @@ RunService:BindToRenderStep("CineSkins", Enum.RenderPriority.Last.Value, functio
             removeSkin(char)
         else
             -- весь скин двигается целиком (без отставания частей -> нет дрожи)
-            pcall(function() e.skin:PivotTo(e.origRoot.CFrame * CFrame.new(0, e.offY, 0)) end)
+            local lunge = 0
+            if e.fakeAtk then
+                local u = (os.clock() - e.fakeAtk) / 0.38
+                if u < 1 then lunge = math.sin(math.pi * u) * 0.8 end
+            end
+            pcall(function() e.skin:PivotTo(e.origRoot.CFrame * CFrame.new(0, e.offY, -lunge)) end)
             local v = e.origRoot.AssemblyLinearVelocity
             local sp = Vector3.new(v.X, 0, v.Z).Magnitude
             local hum = char:FindFirstChildOfClass("Humanoid")
@@ -2092,19 +2165,299 @@ local function visualKill(char, rip)
     return true
 end
 
+---------------------------------------------------------------------
+-- Бой: 3 удара -> замороженный NPC распадается на частицы, подтёки крови, тряска камеры
+---------------------------------------------------------------------
+local TweenService = game:GetService("TweenService")
 local KILL_RIP = true            -- рвать NPC на части (true) или просто «роняем» (false)
+local HITS_TO_KILL = 3
+local FIGHT_TIMEOUT = 7
+local fights = {}   -- [оригинал NPC] = {fake = замороженная копия, root, hits, last}
+local fxGui
+
+local function getFx()
+    if not fxFolder or not fxFolder.Parent then
+        fxFolder = Instance.new("Folder")
+        fxFolder.Name = "CineFX"
+        fxFolder.Parent = workspace
+    end
+    return fxFolder
+end
+
+local function fxNew(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+
+local function ensureFxGui()
+    if fxGui and fxGui.Parent then return fxGui end
+    fxGui = fxNew("ScreenGui", {Name = "CineBlood", ResetOnSpawn = false, DisplayOrder = 998,
+        IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
+    local ok = false
+    if gethui then ok = pcall(function() fxGui.Parent = gethui() end) and fxGui.Parent ~= nil end
+    if not ok then ok = pcall(function() fxGui.Parent = game:GetService("CoreGui") end) and fxGui.Parent ~= nil end
+    if not ok then fxGui.Parent = lp:WaitForChild("PlayerGui") end
+    return fxGui
+end
+
+-- тряска камеры + «удар» по FOV
+local shake = {t0 = 0, dur = 0, mag = 0, fov = 0, base = nil}
+local function cameraShake(mag, dur, fovKick)
+    shake.t0, shake.dur, shake.mag, shake.fov = os.clock(), dur, mag, fovKick or 0
+end
+
+RunService:BindToRenderStep("CineShake", Enum.RenderPriority.Camera.Value + 3, function()
+    local cam = getCam()
+    local t = os.clock() - shake.t0
+    if t < shake.dur then
+        local k = (1 - t / shake.dur) ^ 2
+        local m = shake.mag * k
+        if not shake.base then shake.base = cam.FieldOfView end
+        local r = math.random
+        cam.CFrame = cam.CFrame * CFrame.new((r() - 0.5) * m, (r() - 0.5) * m, 0)
+            * CFrame.Angles((r() - 0.5) * m * 0.04, (r() - 0.5) * m * 0.04, (r() - 0.5) * m * 0.06)
+        cam.FieldOfView = shake.base + shake.fov * k
+    elseif shake.base then
+        cam.FieldOfView = shake.base
+        shake.base = nil
+    end
+end)
+
+local function screenFlash(color, transparency, dur)
+    local g = ensureFxGui()
+    local f = fxNew("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = color,
+        BackgroundTransparency = transparency, BorderSizePixel = 0, ZIndex = 1}, g)
+    TweenService:Create(f, TweenInfo.new(dur), {BackgroundTransparency = 1}):Play()
+    task.delay(dur + 0.1, function() f:Destroy() end)
+end
+
+-- кровавые подтёки на экране (стилизованные капли сверху + пятна)
+local function bloodScreen()
+    local g = ensureFxGui()
+    local rnd = math.random
+    screenFlash(Color3.fromRGB(150, 0, 10), 0.6, 0.7)
+    for _ = 1, 16 do
+        local w = rnd(12, 44)
+        local drip = fxNew("Frame", {AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(rnd(), 0, 0, -6),
+            Size = UDim2.new(0, w, 0, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2}, g)
+        fxNew("UICorner", {CornerRadius = UDim.new(0, w / 2)}, drip)
+        fxNew("UIGradient", {Rotation = 90, Color = ColorSequence.new(Color3.fromRGB(196, 18, 26),
+            Color3.fromRGB(96, 0, 8))}, drip)
+        local len = 0.14 + rnd() * 0.42
+        local dur = 1.4 + rnd() * 1.8
+        task.delay(rnd() * 0.35, function()
+            TweenService:Create(drip, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+                {Size = UDim2.new(0, w, len, 0)}):Play()
+        end)
+        task.delay(4 + rnd() * 1.5, function()
+            TweenService:Create(drip, TweenInfo.new(1.2), {BackgroundTransparency = 1}):Play()
+            task.delay(1.3, function() drip:Destroy() end)
+        end)
+    end
+    for _ = 1, 8 do
+        local sz = rnd(40, 150)
+        local b = fxNew("Frame", {AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(rnd(), rnd() * 0.8), Size = UDim2.fromOffset(sz * 0.4, sz * 0.4),
+            BackgroundColor3 = Color3.fromRGB(rnd(110, 160), 6, 12), BackgroundTransparency = 0.25,
+            BorderSizePixel = 0, ZIndex = 2}, g)
+        fxNew("UICorner", {CornerRadius = UDim.new(1, 0)}, b)
+        TweenService:Create(b, TweenInfo.new(0.12, Enum.EasingStyle.Back), {Size = UDim2.fromOffset(sz, sz)}):Play()
+        task.delay(3.5 + rnd() * 1.5, function()
+            TweenService:Create(b, TweenInfo.new(1.2), {BackgroundTransparency = 1}):Play()
+            task.delay(1.3, function() b:Destroy() end)
+        end)
+    end
+end
+
+local function deathFX()
+    bloodScreen()
+    cameraShake(2.2, 0.7, 10)
+end
+
+-- летящие кусочки
+local function spawnBit(pos, color, vel, size, life, neon)
+    local p = Instance.new("Part")
+    p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.Massless = false, false, false, false, true
+    p.Size = Vector3.new(size, size, size)
+    p.Color = color
+    p.Material = neon and Enum.Material.Neon or Enum.Material.SmoothPlastic
+    p.CFrame = CFrame.new(pos) * CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6)
+    p.Parent = getFx()
+    p.AssemblyLinearVelocity = vel
+    p.AssemblyAngularVelocity = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * 14
+    TweenService:Create(p, TweenInfo.new(life, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+        {Transparency = 1, Size = Vector3.new(size * 0.25, size * 0.25, size * 0.25)}):Play()
+    task.delay(life + 0.1, function() p:Destroy() end)
+end
+
+-- распад модели на кучу частиц цвета её частей
+local function disintegrate(model)
+    local list, total, n, center = {}, 0, 0, Vector3.zero
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") and d.Transparency < 0.9 then
+            local vol = math.max(d.Size.X * d.Size.Y * d.Size.Z, 0.01)
+            list[#list + 1] = {d, vol}
+            total = total + vol
+            center = center + d.Position
+            n = n + 1
+        end
+    end
+    if n == 0 then return end
+    center = center / n
+    local budget = 160
+    for _, it in ipairs(list) do
+        local d, vol = it[1], it[2]
+        local cnt = math.clamp(math.floor(budget * vol / total + 0.5), 1, 24)
+        for _ = 1, cnt do
+            local off = Vector3.new((math.random() - 0.5) * d.Size.X, (math.random() - 0.5) * d.Size.Y,
+                (math.random() - 0.5) * d.Size.Z)
+            local pos = (d.CFrame * CFrame.new(off)).Position
+            local dir = pos - center
+            dir = dir.Magnitude > 0.05 and dir.Unit or Vector3.yAxis
+            local vel = dir * math.random(10, 26) + Vector3.new(math.random(-4, 4), math.random(6, 16), math.random(-4, 4))
+            spawnBit(pos, d.Color, vel, 0.25 + math.random() * 0.45, 1.0 + math.random() * 0.9, false)
+        end
+    end
+end
+
+-- замороженная копия NPC (оригинал на время боя прячется, поэтому «останавливается»)
+local function startFight(orig)
+    local clone = cloneModel(orig)
+    if not clone then return nil end
+    clone.Name = "CineFight"
+    for _, d in ipairs(clone:GetDescendants()) do
+        pcall(function()
+            if d:IsA("LuaSourceContainer") or d:IsA("Sound") or d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+                d:Destroy()
+            elseif d:IsA("BasePart") then
+                d.Anchored, d.CanCollide, d.CanTouch, d.CanQuery = true, false, false, false
+            end
+        end)
+    end
+    local hum = clone:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+            hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+            hum.PlatformStand = true
+            hum.EvaluateStateMachine = false
+        end)
+    end
+    clone.Parent = getFx()
+    local root = rootOf(clone)
+    if not root then clone:Destroy() return nil end
+    vhHide(orig, "fight")
+    local f = {fake = clone, root = root, hits = 0, last = os.clock()}
+    fights[orig] = f
+    return f
+end
+
+local function endFight(orig)
+    local f = fights[orig]
+    if not f then return end
+    fights[orig] = nil
+    pcall(function() f.fake:Destroy() end)
+    vhShow(orig, "fight")
+end
+
+connect(RunService.Heartbeat, function()
+    for orig, f in pairs(fights) do
+        if not f.fake.Parent or not orig.Parent or os.clock() - f.last > FIGHT_TIMEOUT then
+            endFight(orig)
+        end
+    end
+end)
+
+local function finishKill(orig, f)
+    fights[orig] = nil
+    local clone = f.fake
+    if KILL_RIP then
+        disintegrate(clone)
+        pcall(function() clone:Destroy() end)
+        local dummy = Instance.new("Folder")
+        dummy.Name = "CineDeathDummy"
+        dummy.Parent = getFx()
+        deadChars[orig] = {fake = dummy}
+        vhHide(orig, "dead")
+        vhShow(orig, "fight")
+        task.delay(KILL_RESPAWN, function()
+            if deadChars[orig] and deadChars[orig].fake == dummy then reviveChar(orig) end
+        end)
+    else
+        pcall(function() clone:Destroy() end)
+        visualKill(orig, false) -- рэгдолл вместо распада
+        vhShow(orig, "fight")
+    end
+    deathFX()
+end
+
+local function landHit(orig)
+    if not orig or deadChars[orig] or Players:GetPlayerFromCharacter(orig) then return end
+    local f = fights[orig] or startFight(orig)
+    if not f then return end
+    f.hits = f.hits + 1
+    f.last = os.clock()
+    local pos = f.root.Position + Vector3.new(0, 1, 0)
+    for _ = 1, 10 do -- искры от удара
+        spawnBit(pos, Color3.fromRGB(255, 235, 170), Vector3.new(math.random(-14, 14), math.random(4, 14), math.random(-14, 14)),
+            0.2 + math.random() * 0.15, 0.4, true)
+    end
+    pcall(function()
+        local h = Instance.new("Highlight")
+        h.FillColor = Color3.fromRGB(255, 60, 60)
+        h.FillTransparency = 0.4
+        h.OutlineTransparency = 1
+        h.Parent = f.fake
+        TweenService:Create(h, TweenInfo.new(0.2), {FillTransparency = 1}):Play()
+        task.delay(0.25, function() h:Destroy() end)
+        local base = f.fake:GetPivot()
+        local myR = myRootPart()
+        local dir = myR and (f.root.Position - myR.Position) or Vector3.new(0, 0, -1)
+        dir = Vector3.new(dir.X, 0, dir.Z)
+        dir = dir.Magnitude > 0.05 and dir.Unit or Vector3.new(0, 0, -1)
+        f.fake:PivotTo(base + dir * 0.9)
+        task.delay(0.07, function()
+            if f.fake.Parent then f.fake:PivotTo(base + dir * 0.25) end
+        end)
+    end)
+    if f.hits >= HITS_TO_KILL then
+        finishKill(orig, f)
+    else
+        cameraShake(0.55, 0.22, 3)
+        screenFlash(Color3.new(1, 1, 1), 0.88, 0.15)
+        status("Удар " .. f.hits .. " из " .. HITS_TO_KILL)
+    end
+end
+
+local function instantKill(m)
+    if not m or not m.Parent or deadChars[m] or m == lp.Character or Players:GetPlayerFromCharacter(m) then
+        return false
+    end
+    local f = fights[m] or startFight(m)
+    if not f then return false end
+    finishKill(m, f)
+    return true
+end
+
+local function isCandidate(m, h)
+    return m and m:IsA("Model") and m ~= lp.Character and not isSkinModel(m) and not deadChars[m]
+        and not fights[m] and not Players:GetPlayerFromCharacter(m)
+        and (not h:IsA("Humanoid") or h.Health > 0)
+end
+
 local toggleKillUI = function() end
+local pressKillFX = function() end
 
 local function killNearest()
     local myRoot = myRootPart()
     local origin = (S.mode ~= "none" or not myRoot) and getCam().CFrame.Position or myRoot.Position
     local best, bd = nil, KILL_RANGE
     for _, h in ipairs(workspace:GetDescendants()) do
-        if h:IsA("Humanoid") then
+        if h:IsA("Humanoid") or h:IsA("AnimationController") then
             local m = h.Parent
-            if m and m:IsA("Model") and m ~= lp.Character and m.Name ~= "CineDeath"
-                and not isSkinModel(m) and not deadChars[m] and not Players:GetPlayerFromCharacter(m)
-                and h.Health > 0 then
+            if isCandidate(m, h) then
                 local r = rootOf(m)
                 if r then
                     local d = (r.Position - origin).Magnitude
@@ -2113,7 +2466,7 @@ local function killNearest()
             end
         end
     end
-    if best and visualKill(best, KILL_RIP) then
+    if best and instantKill(best) then
         status("Убит (визуально): " .. best.Name)
     else
         status("Рядом нет NPC (до " .. KILL_RANGE .. " м)")
@@ -2124,63 +2477,73 @@ local KILL_FRONT_RANGE = 25   -- дальность «перед тобой» (s
 local KILL_FRONT_DOT = 0.6    -- ширина конуса (0.6 ≈ ±53°)
 local killBusy = false
 
-local function killFront()
-    if killBusy then return end
-    if not S.god then toggleGod(true) end -- на время KILL персонаж неуязвим (клиентская неуязвимость)
-    local myRoot = myRootPart()
-    local cf = getCam().CFrame
-    local origin = (S.mode == "none" and myRoot) and myRoot.Position or cf.Position
-    local look = cf.LookVector
+-- цель перед тобой: сначала уже «замороженные» в бою, потом обычные NPC
+local function findFrontTarget(origin, look)
     local best, bd = nil, KILL_FRONT_RANGE
+    for orig, f in pairs(fights) do
+        if f.root and f.root.Parent then
+            local dir = f.root.Position - origin
+            local dist = dir.Magnitude
+            if dist > 0.1 and dist < bd and look:Dot(dir.Unit) > KILL_FRONT_DOT then best, bd = orig, dist end
+        end
+    end
+    if best then return best end
     for _, h in ipairs(workspace:GetDescendants()) do
-        if h:IsA("Humanoid") then
+        if h:IsA("Humanoid") or h:IsA("AnimationController") then
             local m = h.Parent
-            if m and m:IsA("Model") and m ~= lp.Character and m.Name ~= "CineDeath"
-                and not isSkinModel(m) and not deadChars[m] and not Players:GetPlayerFromCharacter(m)
-                and h.Health > 0 then
+            if isCandidate(m, h) then
                 local r = rootOf(m)
                 if r then
                     local dir = r.Position - origin
                     local dist = dir.Magnitude
-                    if dist > 0.1 and dist < bd and look:Dot(dir.Unit) > KILL_FRONT_DOT then
-                        best, bd = m, dist
-                    end
+                    if dist > 0.1 and dist < bd and look:Dot(dir.Unit) > KILL_FRONT_DOT then best, bd = m, dist end
                 end
             end
         end
     end
+    return best
+end
+
+local function killFront()
+    if killBusy then return end
+    if not S.god then toggleGod(true) end
+    local myRoot = myRootPart()
+    local cf = getCam().CFrame
+    local origin = (S.mode == "none" and myRoot) and myRoot.Position or cf.Position
+    local best = findFrontTarget(origin, cf.LookVector)
     if not best then status("Перед тобой нет NPC") return end
     killBusy = true
     if S.mode == "none" and myRoot then -- повернуться к цели
         pcall(function()
-            local tp = rootOf(best).Position
+            local tr = fights[best] and fights[best].root or rootOf(best)
+            local tp = tr.Position
             myRoot.CFrame = CFrame.lookAt(myRoot.Position, Vector3.new(tp.X, myRoot.Position.Y, tp.Z))
         end)
     end
-    local atk = nil
+    local delay = 0.16
     local e = (puppet and puppet.e) or (lp.Character and skins[lp.Character])
     if e then
-        if e.clips and e.clips.attack and #e.cm > 0 then
+        e.punchSide = ((e.punchSide or -1) == 1) and -1 or 1 -- удары чередуем: правая/левая рука
+        if not S.basicAnim and e.clips and e.clips.attack and #e.cm > 0 then
             e.atkT0 = os.clock()
-            atk = e.clips.attack.len
-        elseif e.attack then
+            delay = math.min(e.clips.attack.len * 0.6, 0.8)
+        elseif not S.basicAnim and e.attack then
             pcall(function() e.attack:Play(0.1) end)
-            atk = 0.5
+            delay = 0.4
         else
             e.fakeAtk = os.clock()
-            atk = 0.4
         end
     end
-    task.delay(atk and math.min(atk * 0.6, 0.8) or 0.15, function()
-        if best.Parent and visualKill(best, KILL_RIP) then status("KILL: " .. best.Name) end
-        task.wait(0.4)
+    task.delay(delay, function()
+        if best.Parent or fights[best] then landHit(best) end
+        task.wait(0.28)
         killBusy = false
     end)
 end
 
 local function killSelected()
     if not (S.target and S.target.Parent) then status("Сначала выбери NPC в списке") return end
-    if visualKill(S.target, KILL_RIP) then
+    if instantKill(S.target) then
         status("Убит (визуально): " .. S.target.Name)
     else
         status("Не удалось (уже «мёртв», игрок или это ты)")
@@ -2249,6 +2612,8 @@ local function startPuppet()
     e.clips = dec
     e.cm = dec and buildClipMotors(model, dec) or {}
     e.arms = buildArms(model, root)
+    e.limbs = buildLimbs(model, root)
+    e.procedural = true
 
     puppet = {model = model, hum = hum, root = root, e = e, realRoot = realRoot, realHum = realHum,
         wasAnchored = realRoot.Anchored, origCF = origCF}
@@ -2441,7 +2806,7 @@ local ACTIONS = {
     HideNPCs = function() toggleHideNPC() end,
     PlayersAsNPC = function() toggleSwap() end,
     CaptureNPC = captureNPC,
-    KillFront = killFront,
+    KillFront = function() pressKillFX() killFront() end,
     Puppet = function() togglePuppet() end,
     KillNearest = killNearest,
     KillSelected = killSelected,
@@ -2722,6 +3087,7 @@ do
     B.god = gbtn(g, "Бессмертие", function() toggleGod() end)
     gbtn(g, "Вылечить себя", healSelf)
     B.puppet = gbtn(g, "", function() togglePuppet() end)
+    B.basic = gbtn(g, "", function() S.basicAnim = not S.basicAnim refreshButtons() end)
     B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 198),
         BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
@@ -2792,7 +3158,7 @@ do
     end
 end
 
--- Экранный интерфейс: большая кнопка KILL справа + джойстик слева (отдельно от панели)
+-- Экранная кнопка KILL: круглая, с «продавливанием» при нажатии (мышь/тап или клавиша X)
 local killGui = new("ScreenGui", {Name = "CineKill", ResetOnSpawn = false, DisplayOrder = 1000,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
 do
@@ -2801,81 +3167,80 @@ do
     if not ok then ok = pcall(function() killGui.Parent = game:GetService("CoreGui") end) and killGui.Parent ~= nil end
     if not ok then killGui.Parent = lp:WaitForChild("PlayerGui") end
 
-    -- KILL: большая область справа
-    local kb = new("TextButton", {Text = "KILL", Size = UDim2.fromScale(0.28, 0.6), AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.fromScale(0.985, 0.52), BackgroundColor3 = Color3.fromRGB(170, 25, 25),
-        BackgroundTransparency = 0.3, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBlack,
-        TextScaled = true, BorderSizePixel = 0}, killGui)
-    new("UITextSizeConstraint", {MaxTextSize = 96}, kb)
-    new("UICorner", {CornerRadius = UDim.new(0, 28)}, kb)
-    new("UIStroke", {Color = Color3.fromRGB(255, 255, 255), Thickness = 3, Transparency = 0.35}, kb)
-    kb.Activated:Connect(killFront)
+    local TweenService = game:GetService("TweenService")
+    local holder = new("Frame", {Name = "KillHolder", Size = UDim2.fromOffset(170, 170), AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -36, 0.62, 0), BackgroundTransparency = 1}, killGui)
+    local scale = new("UIScale", {Scale = 1}, holder)
 
-    -- Джойстик слева
-    local joyActive, joyInput, joyVec = false, nil, Vector2.zero
-    local base = new("Frame", {Name = "JoyBase", Size = UDim2.fromOffset(170, 170), AnchorPoint = Vector2.new(0, 1),
-        Position = UDim2.new(0, 30, 1, -50), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.75,
-        BorderSizePixel = 0, Active = true}, killGui)
-    new("UICorner", {CornerRadius = UDim.new(1, 0)}, base)
-    new("UIStroke", {Color = Color3.new(1, 1, 1), Thickness = 3, Transparency = 0.3}, base)
-    local knob = new("Frame", {Size = UDim2.fromOffset(74, 74), AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = Color3.new(1, 1, 1),
-        BackgroundTransparency = 0.15, BorderSizePixel = 0}, base)
-    new("UICorner", {CornerRadius = UDim.new(1, 0)}, knob)
+    -- мягкая тень под кнопкой
+    local shadow = new("Frame", {Size = UDim2.fromScale(1, 1), Position = UDim2.fromOffset(0, 9),
+        BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.6, BorderSizePixel = 0}, holder)
+    new("UICorner", {CornerRadius = UDim.new(1, 0)}, shadow)
 
-    local function joyUpdate(pos)
-        local c = base.AbsolutePosition + base.AbsoluteSize / 2
-        local d = Vector2.new(pos.X, pos.Y) - c
-        local R = base.AbsoluteSize.X / 2
-        if d.Magnitude > R then d = d.Unit * R end
-        joyVec = d / R
-        knob.Position = UDim2.new(0.5, d.X, 0.5, d.Y)
+    -- внешнее тёмное кольцо
+    local ring = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(38, 10, 14),
+        BorderSizePixel = 0}, holder)
+    new("UICorner", {CornerRadius = UDim.new(1, 0)}, ring)
+    new("UIStroke", {Color = Color3.fromRGB(255, 255, 255), Thickness = 2.5, Transparency = 0.45}, ring)
+
+    -- сама кнопка (цвет задаёт градиент, BackgroundColor3 работает как «затемнитель»)
+    local kb = new("TextButton", {Name = "KillButton", Text = "", AutoButtonColor = false,
+        Size = UDim2.new(1, -20, 1, -20), Position = UDim2.fromOffset(10, 10),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0}, ring)
+    new("UICorner", {CornerRadius = UDim.new(1, 0)}, kb)
+    new("UIGradient", {Rotation = 90, Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 96, 84)),
+        ColorSequenceKeypoint.new(0.55, Color3.fromRGB(214, 36, 44)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(150, 14, 28)),
+    })}, kb)
+    new("UIStroke", {Color = Color3.fromRGB(255, 190, 180), Thickness = 2, Transparency = 0.5}, kb)
+
+    -- блик сверху
+    local gloss = new("Frame", {Size = UDim2.fromScale(0.66, 0.34), Position = UDim2.fromScale(0.17, 0.07),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Active = false}, kb)
+    new("UICorner", {CornerRadius = UDim.new(1, 0)}, gloss)
+    new("UIGradient", {Rotation = 90, Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.55), NumberSequenceKeypoint.new(1, 1)})}, gloss)
+
+    local label = new("TextLabel", {Text = "KILL", Size = UDim2.fromScale(0.78, 0.3), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.48), BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBlack, TextScaled = true, Active = false}, kb)
+    new("UITextSizeConstraint", {MaxTextSize = 40}, label)
+    new("UIStroke", {Color = Color3.fromRGB(90, 0, 10), Thickness = 2, Transparency = 0.15}, label)
+    new("TextLabel", {Text = "[ X ]", Size = UDim2.fromScale(0.5, 0.12), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.74), BackgroundTransparency = 1,
+        TextColor3 = Color3.fromRGB(255, 220, 215), TextTransparency = 0.25,
+        Font = Enum.Font.GothamBold, TextScaled = true, Active = false}, kb)
+
+    -- эффект «нажатия»: кнопка уменьшается, темнеет, тень прижимается, потом пружинит обратно
+    pressKillFX = function()
+        TweenService:Create(scale, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.86}):Play()
+        TweenService:Create(kb, TweenInfo.new(0.07), {BackgroundColor3 = Color3.fromRGB(165, 165, 165)}):Play()
+        TweenService:Create(shadow, TweenInfo.new(0.07), {Position = UDim2.fromOffset(0, 3), BackgroundTransparency = 0.45}):Play()
+        task.delay(0.1, function()
+            TweenService:Create(scale, TweenInfo.new(0.24, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play()
+            TweenService:Create(kb, TweenInfo.new(0.2), {BackgroundColor3 = Color3.new(1, 1, 1)}):Play()
+            TweenService:Create(shadow, TweenInfo.new(0.2), {Position = UDim2.fromOffset(0, 9), BackgroundTransparency = 0.6}):Play()
+        end)
     end
-    local function joyRelease()
-        joyActive, joyInput, joyVec = false, nil, Vector2.zero
-        knob.Position = UDim2.fromScale(0.5, 0.5)
-    end
 
-    base.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            joyActive, joyInput = true, i
-            joyUpdate(i.Position)
-        end
-    end)
-    connect(UIS.InputChanged, function(i)
-        if not joyActive then return end
-        if (i.UserInputType == Enum.UserInputType.Touch and i == joyInput)
-            or (i.UserInputType == Enum.UserInputType.MouseMovement and joyInput.UserInputType == Enum.UserInputType.MouseButton1) then
-            joyUpdate(i.Position)
-        end
-    end)
-    connect(UIS.InputEnded, function(i)
-        if joyActive and (i == joyInput or (i.UserInputType == Enum.UserInputType.MouseButton1
-            and joyInput.UserInputType == Enum.UserInputType.MouseButton1)) then
-            joyRelease()
-        end
+    kb.Activated:Connect(function()
+        pressKillFX()
+        killFront()
     end)
 
-    -- двигаем своего персонажа (после стандартного управления, чтобы наш ввод имел приоритет)
+    -- управление куклой с клавиатуры (WASD + пробел), пока включён режим «Кукла»
     RunService:BindToRenderStep("CineJoy", Enum.RenderPriority.Input.Value + 1, function()
-        if S.mode ~= "none" then return end
-        local hum = (puppet and puppet.hum) or (lp.Character and lp.Character:FindFirstChildOfClass("Humanoid"))
-        if not hum then return end
+        if S.mode ~= "none" or not puppet or typing() then return end
+        local hum = puppet.hum
         local vec = Vector3.zero
-        if joyActive and joyVec.Magnitude > 0.1 then vec = Vector3.new(joyVec.X, 0, joyVec.Y) end
-        if puppet then
-            if not typing() then
-                if UIS:IsKeyDown(K.W) then vec = vec + Vector3.new(0, 0, -1) end
-                if UIS:IsKeyDown(K.S) then vec = vec + Vector3.new(0, 0, 1) end
-                if UIS:IsKeyDown(K.A) then vec = vec + Vector3.new(-1, 0, 0) end
-                if UIS:IsKeyDown(K.D) then vec = vec + Vector3.new(1, 0, 0) end
-                if UIS:IsKeyDown(K.Space) then hum.Jump = true end
-            end
-            if vec.Magnitude > 1 then vec = vec.Unit end
-            hum:Move(vec, true)
-        elseif vec.Magnitude > 0 then
-            hum:Move(vec, true)
-        end
+        if UIS:IsKeyDown(K.W) then vec = vec + Vector3.new(0, 0, -1) end
+        if UIS:IsKeyDown(K.S) then vec = vec + Vector3.new(0, 0, 1) end
+        if UIS:IsKeyDown(K.A) then vec = vec + Vector3.new(-1, 0, 0) end
+        if UIS:IsKeyDown(K.D) then vec = vec + Vector3.new(1, 0, 0) end
+        if UIS:IsKeyDown(K.Space) then hum.Jump = true end
+        if vec.Magnitude > 1 then vec = vec.Unit end
+        hum:Move(vec, true)
     end)
 
     S.killUI = true
@@ -2921,7 +3286,9 @@ refreshButtons = function()
     B.swap.Text = "Игроки = NPC: " .. (S.swap and "ВКЛ" or "ВЫКЛ")
     B.listPlayers.Text = "Игроки в списке: " .. (S.listPlayers and "ДА" or "НЕТ")
     B.killUI.Text = "KILL UI: " .. (S.killUI ~= false and "ВКЛ" or "ВЫКЛ")
-    B.rip.Text = "Рвать на части: " .. (KILL_RIP and "ДА" or "НЕТ")
+    B.rip.Text = "Распад на частицы: " .. (KILL_RIP and "ДА" or "НЕТ")
+    mark(B.basic, S.basicAnim)
+    B.basic.Text = "Только базовая анимация: " .. (S.basicAnim and "ДА" or "НЕТ")
     mark(B.puppet, puppet ~= nil)
     B.puppet.Text = "Кукла (защита): " .. (puppet and "ВКЛ" or "ВЫКЛ")
     B.smooth.Text = "Плавно: " .. (S.smooth and "ВКЛ" or "ВЫКЛ")
@@ -2973,6 +3340,9 @@ genv.__CinePanelCleanup = function()
     clearHide()
     toggleGod(false)
     stopPuppet()
+    for orig in pairs(fights) do endFight(orig) end
+    pcall(function() RunService:UnbindFromRenderStep("CineShake") end)
+    if fxGui then fxGui:Destroy() end
     reviveAll()
     if fxFolder then fxFolder:Destroy() end
     S.selfEntry, S.allEntry, S.swap, S.hideNPC = nil, nil, false, false
