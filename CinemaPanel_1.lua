@@ -4,7 +4,7 @@
       * Spectator за NPC/монстрами (3-е и 1-е лицо), переключение между ними
       * Попытка управлять NPC (работает только если у клиента есть network ownership)
       * Freecam, Camera Lock на выбранном NPC
-      * Расстановка/сохранение/переключение камер (сохраняются в файл, если executor поддерживает writefile)
+      * Расстановка/сохранение/переключение камер (сохраняются в файл, если среда исполнения поддерживает writefile)
       * День <-> Ночь, скрытие игроков
       * Панель с кнопками + горячие клавиши (таблица KEYS ниже)
 ]]
@@ -2194,11 +2194,7 @@ end
 local function ensureFxGui()
     if fxGui and fxGui.Parent then return fxGui end
     fxGui = fxNew("ScreenGui", {Name = "CineBlood", ResetOnSpawn = false, DisplayOrder = 998,
-        IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
-    local ok = false
-    if gethui then ok = pcall(function() fxGui.Parent = gethui() end) and fxGui.Parent ~= nil end
-    if not ok then ok = pcall(function() fxGui.Parent = game:GetService("CoreGui") end) and fxGui.Parent ~= nil end
-    if not ok then fxGui.Parent = lp:WaitForChild("PlayerGui") end
+        IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling}, lp:WaitForChild("PlayerGui"))
     return fxGui
 end
 
@@ -2888,14 +2884,20 @@ local function new(class, props, parent)
     return o
 end
 
-gui = new("ScreenGui", {Name = "CinePanel", ResetOnSpawn = false, DisplayOrder = 999,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
-do
-    local ok = false
-    if gethui then ok = pcall(function() gui.Parent = gethui() end) and gui.Parent ~= nil end
-    if not ok then ok = pcall(function() gui.Parent = game:GetService("CoreGui") end) and gui.Parent ~= nil end
-    if not ok then gui.Parent = lp:WaitForChild("PlayerGui") end
-end
+-- Надёжное размещение интерфейса: PlayerGui — стандартный контейнер ScreenGui
+-- для клиентского интерфейса Roblox. Не используем gethui/CoreGui: они могут
+-- принять объект, который при этом не отображается в игровом окне.
+local playerGui = lp:WaitForChild("PlayerGui")
+local oldGui = playerGui:FindFirstChild("CinePanel")
+if oldGui then oldGui:Destroy() end
+gui = new("ScreenGui", {
+    Name = "CinePanel",
+    ResetOnSpawn = false,
+    Enabled = true,
+    DisplayOrder = 999,
+    IgnoreGuiInset = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
 
 local main = new("Frame", {Size = UDim2.fromOffset(320, 580), Position = UDim2.fromOffset(20, 80),
     BackgroundColor3 = BG, BorderSizePixel = 0, Active = true}, gui)
