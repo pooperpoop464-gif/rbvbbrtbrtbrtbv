@@ -27,6 +27,7 @@ if o then o:Destroy() end
 end
 end)
 end
+local G = {}   -- сюда вынесены функции (у Luau лимит ~200 локальных переменных на функцию)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
@@ -310,20 +311,20 @@ status("Управление NPC выключено")
 end
 refreshButtons()
 end
-local function camsFile() return "CinePanel_" .. tostring(game.PlaceId) .. ".json" end
+function G.camsFile() return "CinePanel_" .. tostring(game.PlaceId) .. ".json" end
 local function saveCams()
 if not writefile then return end
 local t = {}
 for _, c in ipairs(S.cams) do
 table.insert(t, {n = c.name, c = {c.cf:GetComponents()}, f = c.fov})
 end
-pcall(function() writefile(camsFile(), HttpService:JSONEncode(t)) end)
+pcall(function() writefile(G.camsFile(), HttpService:JSONEncode(t)) end)
 end
 local function loadCams()
 if not (isfile and readfile) then return end
-local okExists, exists = pcall(isfile, camsFile())
+local okExists, exists = pcall(isfile, G.camsFile())
 if not (okExists and exists) then return end
-local ok, t = pcall(function() return HttpService:JSONDecode(readfile(camsFile())) end)
+local ok, t = pcall(function() return HttpService:JSONDecode(readfile(G.camsFile())) end)
 if ok and type(t) == "table" then
 for _, e in ipairs(t) do
 S.camId = S.camId + 1
@@ -332,7 +333,7 @@ end
 end
 end
 local markerFolder
-local function refreshMarkers()
+function G.refreshMarkers()
 if markerFolder then markerFolder:Destroy() markerFolder = nil end
 if not S.markers then return end
 markerFolder = Instance.new("Folder")
@@ -365,7 +366,7 @@ local cam = getCam()
 S.camId = S.camId + 1
 table.insert(S.cams, {name = "Cam " .. S.camId, cf = cam.CFrame, fov = (S.mode ~= "none") and S.fov or cam.FieldOfView})
 saveCams()
-refreshMarkers()
+G.refreshMarkers()
 rebuildCamList()
 status("Камера сохранена: Cam " .. S.camId .. " (клавиша " .. #S.cams .. ")")
 end
@@ -385,7 +386,7 @@ refreshButtons()
 end
 local hiddenData = {}
 local hideConns = {}
-local function hideInst(d)
+function G.hideInst(d)
 local prop, hid
 if d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture") then
 prop, hid = "Transparency", 1
@@ -400,23 +401,23 @@ hiddenData[d] = {prop = prop, hid = hid, orig = d[prop]}
 end
 d[prop] = hid
 end
-local function hideChar(char)
-for _, d in ipairs(char:GetDescendants()) do hideInst(d) end
-table.insert(hideConns, char.DescendantAdded:Connect(hideInst))
+function G.hideChar(char)
+for _, d in ipairs(char:GetDescendants()) do G.hideInst(d) end
+table.insert(hideConns, char.DescendantAdded:Connect(G.hideInst))
 end
-local function watchPlayer(p)
+function G.watchPlayer(p)
 if p == lp and not S.hideSelf then return end
-if p.Character then hideChar(p.Character) end
+if p.Character then G.hideChar(p.Character) end
 table.insert(hideConns, p.CharacterAdded:Connect(function(c)
 task.wait()
-hideChar(c)
+G.hideChar(c)
 end))
 end
-local function applyHide()
-for _, p in ipairs(Players:GetPlayers()) do watchPlayer(p) end
-table.insert(hideConns, Players.PlayerAdded:Connect(watchPlayer))
+function G.applyHide()
+for _, p in ipairs(Players:GetPlayers()) do G.watchPlayer(p) end
+table.insert(hideConns, Players.PlayerAdded:Connect(G.watchPlayer))
 end
-local function clearHide()
+function G.clearHide()
 for _, c in ipairs(hideConns) do c:Disconnect() end
 hideConns = {}
 for d, info in pairs(hiddenData) do
@@ -427,8 +428,8 @@ end
 local function toggleHide(force)
 local want = (force == nil) and (not S.hidden) or force
 S.hidden = want
-clearHide()
-if want then applyHide() end
+G.clearHide()
+if want then G.applyHide() end
 status(want and "Игроки скрыты" or "Игроки показаны")
 refreshButtons()
 end
@@ -440,7 +441,7 @@ Lighting.ClockTime = S.night and 0 or 14
 status(S.night and "Ночь" or "День")
 refreshButtons()
 end
-local function resetTime()
+function G.resetTime()
 S.timeLock = false
 Lighting.ClockTime = S.origTime
 status("Время сброшено")
@@ -456,7 +457,7 @@ local godConns = {}
 local godCharConn
 local godHum, godOrigMax
 local godParts = {}
-local function godRelease()
+function G.godRelease()
 for _, c in ipairs(godConns) do c:Disconnect() end
 godConns = {}
 for _, d in ipairs(godParts) do pcall(function() d.CanTouch = true end) end
@@ -472,8 +473,8 @@ end)
 end
 godHum, godOrigMax = nil, nil
 end
-local function godApply(char)
-godRelease()
+function G.godApply(char)
+G.godRelease()
 local hum = char and char:FindFirstChildOfClass("Humanoid")
 if not hum then return end
 godHum = hum
@@ -505,14 +506,14 @@ local want = (force == nil) and (not S.god) or force
 S.god = want
 if godCharConn then godCharConn:Disconnect() godCharConn = nil end
 if want then
-godApply(lp.Character)
+G.godApply(lp.Character)
 godCharConn = lp.CharacterAdded:Connect(function(c)
 task.wait(0.2)
-if S.god then godApply(c) end
+if S.god then G.godApply(c) end
 end)
 status("Бессмертие включено")
 else
-godRelease()
+G.godRelease()
 status("Бессмертие выключено")
 end
 refreshButtons()
@@ -571,7 +572,7 @@ if d.Parent then pcall(function() d[info[1]] = info[3] end) end
 end
 VH[model] = nil
 end
-local function vhClearAll()
+function G.vhClearAll()
 for m, rec in pairs(VH) do
 rec.conn:Disconnect()
 for d, info in pairs(rec.orig) do
@@ -606,7 +607,7 @@ end
 end
 return c
 end
-local function loadAssetModel(id)
+function G.loadAssetModel(id)
 local obj
 local ok, res = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
 if ok and type(res) == "table" and res[1] then obj = res[1] end
@@ -639,7 +640,7 @@ end
 end
 return out
 end
-local function livePlayingIds(model)
+function G.livePlayingIds(model)
 local host = model:FindFirstChildOfClass("Humanoid") or model:FindFirstChildOfClass("AnimationController")
 local animator = host and host:FindFirstChildOfClass("Animator")
 local ids = {}
@@ -652,19 +653,19 @@ end
 end
 return ids
 end
-local function enumByValue(enum, v)
+function G.enumByValue(enum, v)
 for _, it in ipairs(enum:GetEnumItems()) do
 if it.Value == v then return it end
 end
 end
-local function origVal(model, d, prop)
+function G.origVal(model, d, prop)
 local rec = VH[model]
 local info = rec and rec.orig[d]
 if info and info[1] == prop then return info[3] end
 return d[prop]
 end
-local function v3(v) return {v.X, v.Y, v.Z} end
-local function serialize(model)
+function G.v3(v) return {v.X, v.Y, v.Z} end
+function G.serialize(model)
 local root = rootOf(model)
 if not root then return nil end
 local rootCF = root.CFrame
@@ -672,12 +673,12 @@ local parts, idx = {}, {}
 for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("BasePart") then
 local e = {
-n = d.Name, sz = v3(d.Size), cf = {rootCF:ToObjectSpace(d.CFrame):GetComponents()},
+n = d.Name, sz = G.v3(d.Size), cf = {rootCF:ToObjectSpace(d.CFrame):GetComponents()},
 col = {d.Color.R, d.Color.G, d.Color.B}, mat = d.Material.Value,
-tr = origVal(model, d, "Transparency"), rf = d.Reflectance,
+tr = G.origVal(model, d, "Transparency"), rf = d.Reflectance,
 }
 if d:IsA("MeshPart") then
-e.mid, e.tid, e.msz = d.MeshId, d.TextureID, v3(d.MeshSize)
+e.mid, e.tid, e.msz = d.MeshId, d.TextureID, G.v3(d.MeshSize)
 if e.tid == "" then
 pcall(function() e.tid = d.TextureContent.Uri or "" end)
 end
@@ -690,7 +691,7 @@ if d:IsA("Part") then e.shape = d.Shape.Value end
 end
 for _, c in ipairs(d:GetChildren()) do
 if c:IsA("SpecialMesh") then
-e.sm = {t = c.MeshType.Value, id = c.MeshId, tx = c.TextureId, sc = v3(c.Scale), of = v3(c.Offset)}
+e.sm = {t = c.MeshType.Value, id = c.MeshId, tx = c.TextureId, sc = G.v3(c.Scale), of = G.v3(c.Offset)}
 elseif c:IsA("SurfaceAppearance") then
 e.sa = {c = c.ColorMap, n = c.NormalMap, m = c.MetalnessMap, r = c.RoughnessMap}
 pcall(function()
@@ -702,10 +703,10 @@ end)
 elseif c:IsA("Texture") then
 e.tx = e.tx or {}
 table.insert(e.tx, {t = c.Texture, f = c.Face.Value, u = c.StudsPerTileU, v = c.StudsPerTileV,
-tr = origVal(model, c, "Transparency")})
+tr = G.origVal(model, c, "Transparency")})
 elseif c:IsA("Decal") then
 e.dc = e.dc or {}
-table.insert(e.dc, {t = c.Texture, f = c.Face.Value, tr = origVal(model, c, "Transparency")})
+table.insert(e.dc, {t = c.Texture, f = c.Face.Value, tr = G.origVal(model, c, "Transparency")})
 end
 end
 parts[#parts + 1] = e
@@ -739,7 +740,7 @@ end
 return {name = model.Name, root = idx[root], parts = parts, joints = joints, hip = hum and hum.HipHeight or 0,
 rig = hum and hum.RigType.Value or 1, clo = clo, anim = readAnimIds(model)}
 end
-local function deserialize(desc)
+function G.deserialize(desc)
 local model = Instance.new("Model")
 model.Name = desc.name or "Captured"
 local parts, connected = {}, {}
@@ -776,15 +777,15 @@ p.Name = e.n
 p.Anchored, p.CanCollide, p.Massless = false, false, true
 p.Size = Vector3.new(e.sz[1], e.sz[2], e.sz[3])
 p.Color = Color3.new(e.col[1], e.col[2], e.col[3])
-p.Material = enumByValue(Enum.Material, e.mat) or Enum.Material.Plastic
+p.Material = G.enumByValue(Enum.Material, e.mat) or Enum.Material.Plastic
 p.Transparency = e.tr or 0
 p.Reflectance = e.rf or 0
 if e.shape and p.ClassName == "Part" then
-pcall(function() p.Shape = enumByValue(Enum.PartType, e.shape) end)
+pcall(function() p.Shape = G.enumByValue(Enum.PartType, e.shape) end)
 end
 if e.sm then
 local sm = Instance.new("SpecialMesh")
-sm.MeshType = enumByValue(Enum.MeshType, e.sm.t) or Enum.MeshType.FileMesh
+sm.MeshType = G.enumByValue(Enum.MeshType, e.sm.t) or Enum.MeshType.FileMesh
 if e.sm.id and e.sm.id ~= "" then sm.MeshId = e.sm.id end
 sm.TextureId = e.sm.tx or ""
 sm.Scale = Vector3.new(table.unpack(e.sm.sc))
@@ -794,14 +795,14 @@ end
 for _, dd in ipairs(e.dc or {}) do
 local dc = Instance.new("Decal")
 dc.Texture = dd.t
-dc.Face = enumByValue(Enum.NormalId, dd.f) or Enum.NormalId.Front
+dc.Face = G.enumByValue(Enum.NormalId, dd.f) or Enum.NormalId.Front
 dc.Transparency = dd.tr or 0
 dc.Parent = p
 end
 for _, tt in ipairs(e.tx or {}) do
 local tx = Instance.new("Texture")
 tx.Texture = tt.t
-tx.Face = enumByValue(Enum.NormalId, tt.f) or Enum.NormalId.Front
+tx.Face = G.enumByValue(Enum.NormalId, tt.f) or Enum.NormalId.Front
 tx.StudsPerTileU, tx.StudsPerTileV = tt.u or 2, tt.v or 2
 tx.Transparency = tt.tr or 0
 tx.Parent = p
@@ -846,7 +847,7 @@ w.Parent = p
 end
 end
 local hum = Instance.new("Humanoid")
-pcall(function() hum.RigType = enumByValue(Enum.HumanoidRigType, desc.rig or 1) or Enum.HumanoidRigType.R15 end)
+pcall(function() hum.RigType = G.enumByValue(Enum.HumanoidRigType, desc.rig or 1) or Enum.HumanoidRigType.R15 end)
 hum.HipHeight = desc.hip or 0
 hum.Parent = model
 Instance.new("Animator", hum)
@@ -865,7 +866,7 @@ end
 for _, m in ipairs(clo.cm or {}) do
 pcall(function()
 local cm = Instance.new("CharacterMesh")
-cm.BodyPart = enumByValue(Enum.BodyPart, m.b)
+cm.BodyPart = G.enumByValue(Enum.BodyPart, m.b)
 cm.MeshId, cm.OverlayTextureId, cm.BaseTextureId = m.m, m.o, m.t
 cm.Parent = model
 end)
@@ -917,9 +918,9 @@ status("У «" .. entry.name .. "» нет ID — введи ID и нажми «
 entry.failT = os.clock()
 return nil
 end
-src = loadAssetModel(entry.id)
+src = G.loadAssetModel(entry.id)
 elseif entry.kind == "capture" and entry.desc then
-local ok, m = pcall(deserialize, entry.desc)
+local ok, m = pcall(G.deserialize, entry.desc)
 if ok then src = m end
 end
 if src then
@@ -986,10 +987,10 @@ if not root then skin:Destroy() return nil end
 root.Anchored = true
 return skin, root, hip
 end
-local function isIdentity(cf)
+function G.isIdentity(cf)
 return cf.RightVector:Dot(Vector3.xAxis) > 0.999 and cf.UpVector:Dot(Vector3.yAxis) > 0.999
 end
-local function setupTracks(skin, entry)
+function G.setupTracks(skin, entry)
 local anim = entry and entry.anim
 if not anim or next(anim) == nil then return nil, nil end
 local host = skin:FindFirstChildOfClass("Humanoid") or skin:FindFirstChildOfClass("AnimationController")
@@ -1029,7 +1030,7 @@ print("[CinePanel] " .. txt)
 end
 local ContentProvider = game:GetService("ContentProvider")
 local function digits(x) return tostring(x):match("%d+") end
-local function patchFailedMeshes(skin, label)
+function G.patchFailedMeshes(skin, label)
 task.spawn(function()
 local total, failed, pending = 0, 0, 0
 for _, d in ipairs(skin:GetDescendants()) do
@@ -1072,7 +1073,7 @@ pushDiag()
 end
 end)
 end
-local function checkTextures(skin)
+function G.checkTextures(skin)
 task.spawn(function()
 local tid, sa, deco, empty, failed, pending = 0, 0, 0, 0, 0, 0
 local function probe(inst)
@@ -1106,7 +1107,7 @@ tid, sa, deco, empty, failed, diagInfo.fixed, skin:GetAttribute("CineUnsup") or 
 pushDiag()
 end)
 end
-local function syncVisuals(skin, orig)
+function G.syncVisuals(skin, orig)
 if not (orig and orig.Parent) then return 0 end
 local function key(counter, p)
 counter[p.Name] = (counter[p.Name] or 0) + 1
@@ -1167,7 +1168,7 @@ return false
 end
 return n:find("shoulder") ~= nil or n:find("arm") ~= nil
 end
-local function armToward(m, target)
+function G.armToward(m, target)
 local p0, p1 = m.Part0, m.Part1
 if not (p0 and p1) then return nil end
 local F = p0.CFrame * m.C0
@@ -1183,25 +1184,25 @@ local ang = math.acos(math.clamp(d, -1, 1)) * 0.95
 local Tj = CFrame.new(J) * CFrame.fromAxisAngle(axis.Unit, ang) * CFrame.new(-J)
 return F:Inverse() * Tj * F
 end
-local function limbSide(m, idx)
+function G.limbSide(m, idx)
 local n = string.lower(m.Name .. " " .. (m.Part1 and m.Part1.Name or ""))
 if n:find("right") then return 1 end
 if n:find("left") then return -1 end
 return (idx % 2 == 0) and 1 or -1
 end
-local function buildArms(model, root)
+function G.buildArms(model, root)
 local arms, idx = {}, 0
 local down = -root.CFrame.UpVector
 local fwd = (root.CFrame.LookVector * 0.9 + root.CFrame.UpVector * 0.1).Unit
 for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("Motor6D") and isArmJoint(d) then
 idx = idx + 1
-arms[#arms + 1] = {d, armToward(d, down), armToward(d, fwd), limbSide(d, idx)}
+arms[#arms + 1] = {d, G.armToward(d, down), G.armToward(d, fwd), G.limbSide(d, idx)}
 end
 end
 return arms
 end
-local function limbKind(m)
+function G.limbKind(m)
 if isArmJoint(m) then return "arm" end
 local n = string.lower(m.Name .. " " .. (m.Part1 and m.Part1.Name or ""))
 if n:find("lower") or n:find("knee") or n:find("foot") or n:find("ankle") or n:find("toe")
@@ -1211,24 +1212,24 @@ end
 if n:find("hip") or n:find("thigh") or n:find("leg") then return "leg" end
 return nil
 end
-local function buildLimbs(model, root)
+function G.buildLimbs(model, root)
 local list, cnt = {}, {arm = 0, leg = 0}
 local axisW = root.CFrame.RightVector
 local down = -root.CFrame.UpVector
 for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("Motor6D") and d.Part0 and d.Part1 then
-local kind = limbKind(d)
+local kind = G.limbKind(d)
 if kind then
 cnt[kind] = cnt[kind] + 1
 local F = d.Part0.CFrame * d.C0
-list[#list + 1] = {m = d, kind = kind, side = limbSide(d, cnt[kind]),
-axis = F:VectorToObjectSpace(axisW), base = (kind == "arm") and armToward(d, down) or nil}
+list[#list + 1] = {m = d, kind = kind, side = G.limbSide(d, cnt[kind]),
+axis = F:VectorToObjectSpace(axisW), base = (kind == "arm") and G.armToward(d, down) or nil}
 end
 end
 end
 return list
 end
-local function decodeClips(raw)
+function G.decodeClips(raw)
 if not raw or not raw.keys then return nil end
 local out = {keys = raw.keys, keyIndex = {}}
 for j, k in ipairs(raw.keys) do out.keyIndex[k] = j end
@@ -1252,15 +1253,15 @@ end
 end
 return any and out or nil
 end
-local function entryClips(entry)
+function G.entryClips(entry)
 if not (entry and entry.clips) then return nil end
 if entry._dec == nil then
-local ok, r = pcall(decodeClips, entry.clips)
+local ok, r = pcall(G.decodeClips, entry.clips)
 entry._dec = (ok and r) or false
 end
 return entry._dec or nil
 end
-local function buildClipMotors(model, dec)
+function G.buildClipMotors(model, dec)
 local list, cnt = {}, {}
 for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("Motor6D") then
@@ -1271,7 +1272,7 @@ end
 end
 return list
 end
-local function applyClip(e, c, t, loop)
+function G.applyClip(e, c, t, loop)
 local n = c.n
 local pos = t * CLIP_FPS
 local i = math.floor(pos)
@@ -1304,7 +1305,7 @@ if useRecorded and cl and e.cm and #e.cm > 0 then
 if e.atkT0 and cl.attack then
 local t = os.clock() - e.atkT0
 if t < cl.attack.len then
-applyClip(e, cl.attack, t, false)
+G.applyClip(e, cl.attack, t, false)
 return true
 end
 e.atkT0 = nil
@@ -1318,7 +1319,7 @@ if c then
 local scale = 1
 if want ~= "idle" and c.sp and c.sp > 0.5 then scale = math.clamp(e.sm / c.sp, 0.5, 2) end
 e.ct = (e.ct or 0) + dt * scale
-applyClip(e, c, e.ct, true)
+G.applyClip(e, c, e.ct, true)
 return true
 end
 end
@@ -1372,7 +1373,7 @@ return true
 end
 return false
 end
-local function applyFakeAttack(e)
+function G.applyFakeAttack(e)
 local u = (os.clock() - e.fakeAtk) / 0.38
 if u >= 1 then e.fakeAtk = nil return end
 local s = math.sin(math.pi * u)
@@ -1392,10 +1393,10 @@ local skin, root, hip = buildSkin(src)
 if not skin then return false end
 skin.Name = "CineSkin"
 skin.Parent = getSkinFolder()
-if entry and entry.orig then diagInfo.fixed = syncVisuals(skin, entry.orig) end
+if entry and entry.orig then diagInfo.fixed = G.syncVisuals(skin, entry.orig) end
 if entry and (entry.kind == "capture" or entry.kind == "asset") then
-patchFailedMeshes(skin, entry.name)
-checkTextures(skin)
+G.patchFailedMeshes(skin, entry.name)
+G.checkTextures(skin)
 end
 for _, d in ipairs(skin:GetDescendants()) do
 pcall(function()
@@ -1417,7 +1418,7 @@ local origMotors, pairsList = {}, {}
 for _, d in ipairs(char:GetDescendants()) do
 if d:IsA("Motor6D") then origMotors[d.Name] = d end
 end
-local arms = buildArms(skin, root)
+local arms = G.buildArms(skin, root)
 local armDown = {}
 for _, a in ipairs(arms) do armDown[a[1]] = a[2] end
 for _, d in ipairs(skin:GetDescendants()) do
@@ -1431,13 +1432,13 @@ local matched = 0
 for _, pr in ipairs(pairsList) do
 if pr[2] then matched = matched + 1 end
 end
-local tracks, attackTr = setupTracks(skin, entry)
-local dec = entryClips(entry)
+local tracks, attackTr = G.setupTracks(skin, entry)
+local dec = G.entryClips(entry)
 vhHide(char, "skin")
 skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY,
 motors = pairsList, fb = pairsList, tracks = tracks, attack = attackTr, t0 = os.clock(),
-clips = dec, cm = dec and buildClipMotors(skin, dec) or {}, arms = arms,
-limbs = buildLimbs(skin, root), procedural = (matched == 0),
+clips = dec, cm = dec and G.buildClipMotors(skin, dec) or {}, arms = arms,
+limbs = G.buildLimbs(skin, root), procedural = (matched == 0),
 isPlayer = Players:GetPlayerFromCharacter(char) ~= nil, entry = entry, parked = false}
 task.delay(1.5, function()
 local cur = skins[char]
@@ -1478,7 +1479,7 @@ for _, pr in ipairs(e.motors) do
 local m, o, sg = pr[1], pr[2], pr[3]
 if m.Parent then
 local t = o and o.Parent and o.Transform
-if sg and (not t or isIdentity(t)) then
+if sg and (not t or G.isIdentity(t)) then
 m.Transform = sg -- руки вниз
 elseif t then
 m.Transform = t
@@ -1487,7 +1488,7 @@ end
 end
 end
 end
-if e.fakeAtk then applyFakeAttack(e) end
+if e.fakeAtk then G.applyFakeAttack(e) end
 local park = (e.dead or (S.hidden and e.isPlayer and (char ~= lp.Character or S.hideSelf))) and true or false
 if park ~= e.parked then
 e.parked = park
@@ -1513,7 +1514,7 @@ for _, a in ipairs(e.arms or {}) do
 if a[1].Parent and a[2] then a[1].Transform = a[2] end
 end
 end
-if e.fakeAtk then applyFakeAttack(e) end
+if e.fakeAtk then G.applyFakeAttack(e) end
 end
 end
 end)
@@ -1588,7 +1589,7 @@ updateNPCHide()
 status(S.hideNPC and "NPC скрыты (выбранный виден)" or "NPC показаны")
 refreshButtons()
 end
-local function buildTemplates()
+function G.buildTemplates()
 for _, t in ipairs(swapTemplates) do
 if t.src then pcall(function() t.src:Destroy() end) end
 end
@@ -1611,7 +1612,7 @@ end
 local function toggleSwap(force)
 if force == nil then force = not S.swap end
 if force then
-buildTemplates()
+G.buildTemplates()
 if #swapTemplates == 0 then
 status("NPC не найдены — подменять нечем")
 return
@@ -1639,39 +1640,39 @@ status("Подмена игроков выключена")
 end
 refreshButtons()
 end
-local function needSel()
+function G.needSel()
 if not libSel then status("Сначала выбери модель в списке") end
 return libSel
 end
-local function applySelf()
-local e = needSel()
+function G.applySelf()
+local e = G.needSel()
 if not e then return end
 S.selfEntry = e
 status("Загружаю модель: " .. e.name)
 reconcileAsync()
 rebuildLibList()
 end
-local function clearSelf()
+function G.clearSelf()
 S.selfEntry = nil
 reconcileAsync()
 status("Твоя модель возвращена")
 rebuildLibList()
 end
-local function applyOthers()
-local e = needSel()
+function G.applyOthers()
+local e = G.needSel()
 if not e then return end
 S.allEntry = e
 status("Модель для других игроков: " .. e.name)
 reconcileAsync()
 rebuildLibList()
 end
-local function clearOthers()
+function G.clearOthers()
 S.allEntry = nil
 reconcileAsync()
 status("Модели других игроков возвращены")
 rebuildLibList()
 end
-local function deleteSel()
+function G.deleteSel()
 local e = libSel
 if not e then return end
 for i, x in ipairs(LIB) do
@@ -1685,7 +1686,7 @@ reconcileAsync()
 rebuildLibList()
 status("Удалено: " .. e.name)
 end
-local function observeAnims(model, entry, duration)
+function G.observeAnims(model, entry, duration)
 task.spawn(function()
 entry.anim = entry.anim or {}
 local keys, motors, cnt = {}, {}, {}
@@ -1725,7 +1726,7 @@ moving = true
 end
 local isAtk = false
 local key = moving and (smooth > 14 and "run" or "walk") or "idle"
-for _, t in ipairs(livePlayingIds(model)) do
+for _, t in ipairs(G.livePlayingIds(model)) do
 local nm = string.lower(t.name or "")
 local atk = (not t.looped) or nm:find("attack") or nm:find("kill") or nm:find("grab")
 or nm:find("slash") or nm:find("bite") or nm:find("hit") or nm:find("swing")
@@ -1797,17 +1798,17 @@ reconcileAsync()
 end
 end)
 end
-local function recordAttacks()
+function G.recordAttacks()
 local m = S.target
 if not (m and m.Parent) then status("Выбери NPC во вкладке NPC") return end
 local e = libSel
 if not e then status("Выбери модель в списке библиотеки") return end
 e.anim = e.anim or {}
 if e.desc then e.desc.anim = e.anim end
-observeAnims(m, e, 40)
+G.observeAnims(m, e, 40)
 status("Записываю 40 с: пусть NPC постоит, походит и атакует")
 end
-local function setAttackId(idText)
+function G.setAttackId(idText)
 local e = libSel
 if not e then status("Выбери модель в списке") return end
 local id = tonumber((idText or ""):match("%d+"))
@@ -1830,7 +1831,7 @@ m = S.target
 end
 local src = cloneModel(m)
 if not src then status("Не удалось скопировать модель") return end
-local ok, desc = pcall(serialize, m)
+local ok, desc = pcall(G.serialize, m)
 local base, name, n = m.Name, m.Name, 1
 local function exists(nm)
 for _, e in ipairs(LIB) do
@@ -1846,7 +1847,7 @@ local entry = {name = name, kind = "capture", src = src, desc = ok and desc or n
 entry.orig = m
 entry.anim = readAnimIds(m)
 if entry.desc then entry.desc.anim = entry.anim end
-observeAnims(m, entry, 20)
+G.observeAnims(m, entry, 20)
 table.insert(LIB, entry)
 libSel = entry
 saveLib()
@@ -1854,7 +1855,7 @@ rebuildLibList()
 status("Скопировано: " .. name .. (entry.desc and (writefile and " (в файл)" or "") or " (только сессия)")
 .. ". Запоминаю анимации 20 с — пусть NPC постоит и пройдётся")
 end
-local function addById(nameText, idText)
+function G.addById(nameText, idText)
 local id = tonumber((idText or ""):match("%d+"))
 if not id then status("Введи числовой ID модели") return end
 local name = (nameText or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -1994,7 +1995,7 @@ local HITS_TO_KILL = 3
 local FIGHT_TIMEOUT = 7
 local fights = {}   -- [оригинал NPC] = {fake = замороженная копия, root, hits, last}
 local fxGui
-local function getFx()
+function G.getFx()
 if not fxFolder or not fxFolder.Parent then
 fxFolder = Instance.new("Folder")
 fxFolder.Name = "CineFX"
@@ -2002,15 +2003,15 @@ fxFolder.Parent = workspace
 end
 return fxFolder
 end
-local function fxNew(class, props, parent)
+function G.fxNew(class, props, parent)
 local o = Instance.new(class)
 for k, v in pairs(props) do o[k] = v end
 if parent then o.Parent = parent end
 return o
 end
-local function ensureFxGui()
+function G.ensureFxGui()
 if fxGui and fxGui.Parent then return fxGui end
-fxGui = fxNew("ScreenGui", {Name = "CineBlood", ResetOnSpawn = false, DisplayOrder = 998,
+fxGui = G.fxNew("ScreenGui", {Name = "CineBlood", ResetOnSpawn = false, DisplayOrder = 998,
 IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
 local ok = false
 if gethui then ok = pcall(function() fxGui.Parent = gethui() end) and fxGui.Parent ~= nil end
@@ -2019,7 +2020,7 @@ if not ok then fxGui.Parent = lp:WaitForChild("PlayerGui") end
 return fxGui
 end
 local shake = {t0 = 0, dur = 0, mag = 0, fov = 0, base = nil}
-local function cameraShake(mag, dur, fovKick)
+function G.cameraShake(mag, dur, fovKick)
 shake.t0, shake.dur, shake.mag, shake.fov = os.clock(), dur, mag, fovKick or 0
 end
 RunService:BindToRenderStep("CineShake", Enum.RenderPriority.Camera.Value + 3, function()
@@ -2038,23 +2039,23 @@ cam.FieldOfView = shake.base
 shake.base = nil
 end
 end)
-local function screenFlash(color, transparency, dur)
-local g = ensureFxGui()
-local f = fxNew("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = color,
+function G.screenFlash(color, transparency, dur)
+local g = G.ensureFxGui()
+local f = G.fxNew("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = color,
 BackgroundTransparency = transparency, BorderSizePixel = 0, ZIndex = 1}, g)
 TweenService:Create(f, TweenInfo.new(dur), {BackgroundTransparency = 1}):Play()
 task.delay(dur + 0.1, function() f:Destroy() end)
 end
-local function bloodScreen()
-local g = ensureFxGui()
+function G.bloodScreen()
+local g = G.ensureFxGui()
 local rnd = math.random
-screenFlash(Color3.fromRGB(150, 0, 10), 0.6, 0.7)
+G.screenFlash(Color3.fromRGB(150, 0, 10), 0.6, 0.7)
 for _ = 1, 16 do
 local w = rnd(12, 44)
-local drip = fxNew("Frame", {AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(rnd(), 0, 0, -6),
+local drip = G.fxNew("Frame", {AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(rnd(), 0, 0, -6),
 Size = UDim2.new(0, w, 0, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2}, g)
-fxNew("UICorner", {CornerRadius = UDim.new(0, w / 2)}, drip)
-fxNew("UIGradient", {Rotation = 90, Color = ColorSequence.new(Color3.fromRGB(196, 18, 26),
+G.fxNew("UICorner", {CornerRadius = UDim.new(0, w / 2)}, drip)
+G.fxNew("UIGradient", {Rotation = 90, Color = ColorSequence.new(Color3.fromRGB(196, 18, 26),
 Color3.fromRGB(96, 0, 8))}, drip)
 local len = 0.14 + rnd() * 0.42
 local dur = 1.4 + rnd() * 1.8
@@ -2069,11 +2070,11 @@ end)
 end
 for _ = 1, 8 do
 local sz = rnd(40, 150)
-local b = fxNew("Frame", {AnchorPoint = Vector2.new(0.5, 0.5),
+local b = G.fxNew("Frame", {AnchorPoint = Vector2.new(0.5, 0.5),
 Position = UDim2.fromScale(rnd(), rnd() * 0.8), Size = UDim2.fromOffset(sz * 0.4, sz * 0.4),
 BackgroundColor3 = Color3.fromRGB(rnd(110, 160), 6, 12), BackgroundTransparency = 0.25,
 BorderSizePixel = 0, ZIndex = 2}, g)
-fxNew("UICorner", {CornerRadius = UDim.new(1, 0)}, b)
+G.fxNew("UICorner", {CornerRadius = UDim.new(1, 0)}, b)
 TweenService:Create(b, TweenInfo.new(0.12, Enum.EasingStyle.Back), {Size = UDim2.fromOffset(sz, sz)}):Play()
 task.delay(3.5 + rnd() * 1.5, function()
 TweenService:Create(b, TweenInfo.new(1.2), {BackgroundTransparency = 1}):Play()
@@ -2082,24 +2083,24 @@ end)
 end
 end
 local function deathFX()
-bloodScreen()
-cameraShake(2.2, 0.7, 10)
+G.bloodScreen()
+G.cameraShake(2.2, 0.7, 10)
 end
-local function spawnBit(pos, color, vel, size, life, neon)
+function G.spawnBit(pos, color, vel, size, life, neon)
 local p = Instance.new("Part")
 p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.Massless = false, false, false, false, true
 p.Size = Vector3.new(size, size, size)
 p.Color = color
 p.Material = neon and Enum.Material.Neon or Enum.Material.SmoothPlastic
 p.CFrame = CFrame.new(pos) * CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6)
-p.Parent = getFx()
+p.Parent = G.getFx()
 p.AssemblyLinearVelocity = vel
 p.AssemblyAngularVelocity = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * 14
 TweenService:Create(p, TweenInfo.new(life, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
 {Transparency = 1, Size = Vector3.new(size * 0.25, size * 0.25, size * 0.25)}):Play()
 task.delay(life + 0.1, function() p:Destroy() end)
 end
-local function disintegrate(model)
+function G.disintegrate(model)
 local list, total, n, center = {}, 0, 0, Vector3.zero
 for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("BasePart") and d.Transparency < 0.9 then
@@ -2123,11 +2124,11 @@ local pos = (d.CFrame * CFrame.new(off)).Position
 local dir = pos - center
 dir = dir.Magnitude > 0.05 and dir.Unit or Vector3.yAxis
 local vel = dir * math.random(10, 26) + Vector3.new(math.random(-4, 4), math.random(6, 16), math.random(-4, 4))
-spawnBit(pos, d.Color, vel, 0.25 + math.random() * 0.45, 1.0 + math.random() * 0.9, false)
+G.spawnBit(pos, d.Color, vel, 0.25 + math.random() * 0.45, 1.0 + math.random() * 0.9, false)
 end
 end
 end
-local function startFight(orig)
+function G.startFight(orig)
 local clone = cloneModel(orig)
 if not clone then return nil end
 clone.Name = "CineFight"
@@ -2149,7 +2150,7 @@ hum.PlatformStand = true
 hum.EvaluateStateMachine = false
 end)
 end
-clone.Parent = getFx()
+clone.Parent = G.getFx()
 local root = rootOf(clone)
 if not root then clone:Destroy() return nil end
 vhHide(orig, "fight")
@@ -2157,7 +2158,7 @@ local f = {fake = clone, root = root, hits = 0, last = os.clock()}
 fights[orig] = f
 return f
 end
-local function endFight(orig)
+function G.endFight(orig)
 local f = fights[orig]
 if not f then return end
 fights[orig] = nil
@@ -2167,19 +2168,19 @@ end
 connect(RunService.Heartbeat, function()
 for orig, f in pairs(fights) do
 if not f.fake.Parent or not orig.Parent or os.clock() - f.last > FIGHT_TIMEOUT then
-endFight(orig)
+G.endFight(orig)
 end
 end
 end)
-local function finishKill(orig, f)
+function G.finishKill(orig, f)
 fights[orig] = nil
 local clone = f.fake
 if KILL_RIP then
-disintegrate(clone)
+G.disintegrate(clone)
 pcall(function() clone:Destroy() end)
 local dummy = Instance.new("Folder")
 dummy.Name = "CineDeathDummy"
-dummy.Parent = getFx()
+dummy.Parent = G.getFx()
 deadChars[orig] = {fake = dummy}
 vhHide(orig, "dead")
 vhShow(orig, "fight")
@@ -2195,13 +2196,13 @@ deathFX()
 end
 local function landHit(orig)
 if not orig or deadChars[orig] or Players:GetPlayerFromCharacter(orig) then return end
-local f = fights[orig] or startFight(orig)
+local f = fights[orig] or G.startFight(orig)
 if not f then return end
 f.hits = f.hits + 1
 f.last = os.clock()
 local pos = f.root.Position + Vector3.new(0, 1, 0)
 for _ = 1, 10 do -- искры от удара
-spawnBit(pos, Color3.fromRGB(255, 235, 170), Vector3.new(math.random(-14, 14), math.random(4, 14), math.random(-14, 14)),
+G.spawnBit(pos, Color3.fromRGB(255, 235, 170), Vector3.new(math.random(-14, 14), math.random(4, 14), math.random(-14, 14)),
 0.2 + math.random() * 0.15, 0.4, true)
 end
 pcall(function()
@@ -2223,10 +2224,10 @@ if f.fake.Parent then f.fake:PivotTo(base + dir * 0.25) end
 end)
 end)
 if f.hits >= HITS_TO_KILL then
-finishKill(orig, f)
+G.finishKill(orig, f)
 else
-cameraShake(0.55, 0.22, 3)
-screenFlash(Color3.new(1, 1, 1), 0.88, 0.15)
+G.cameraShake(0.55, 0.22, 3)
+G.screenFlash(Color3.new(1, 1, 1), 0.88, 0.15)
 status("Удар " .. f.hits .. " из " .. HITS_TO_KILL)
 end
 end
@@ -2234,9 +2235,9 @@ local function instantKill(m)
 if not m or not m.Parent or deadChars[m] or m == lp.Character or Players:GetPlayerFromCharacter(m) then
 return false
 end
-local f = fights[m] or startFight(m)
+local f = fights[m] or G.startFight(m)
 if not f then return false end
-finishKill(m, f)
+G.finishKill(m, f)
 return true
 end
 local function isCandidate(m, h)
@@ -2271,7 +2272,7 @@ end
 local KILL_FRONT_RANGE = 25   -- дальность «перед тобой» (studs)
 local KILL_FRONT_DOT = 0.6    -- ширина конуса (0.6 ≈ ±53°)
 local killBusy = false
-local function findFrontTarget(origin, look)
+function G.findFrontTarget(origin, look)
 local best, bd = nil, KILL_FRONT_RANGE
 for orig, f in pairs(fights) do
 if f.root and f.root.Parent then
@@ -2302,7 +2303,7 @@ if not S.god then toggleGod(true) end
 local myRoot = myRootPart()
 local cf = getCam().CFrame
 local origin = (S.mode == "none" and myRoot) and myRoot.Position or cf.Position
-local best = findFrontTarget(origin, cf.LookVector)
+local best = G.findFrontTarget(origin, cf.LookVector)
 if not best then status("Перед тобой нет NPC") return end
 killBusy = true
 if S.mode == "none" and myRoot then -- повернуться к цели
@@ -2391,12 +2392,12 @@ model.Name = "CinePuppet"
 model.Parent = getSkinFolder()
 pcall(function() model:PivotTo(origCF) end)
 local e = {skin = model, root = root, t0 = os.clock(), motors = {}, fb = {}}
-e.tracks, e.attack = setupTracks(model, {anim = animIds})
-local dec = entryClips(entry)
+e.tracks, e.attack = G.setupTracks(model, {anim = animIds})
+local dec = G.entryClips(entry)
 e.clips = dec
-e.cm = dec and buildClipMotors(model, dec) or {}
-e.arms = buildArms(model, root)
-e.limbs = buildLimbs(model, root)
+e.cm = dec and G.buildClipMotors(model, dec) or {}
+e.arms = G.buildArms(model, root)
+e.limbs = G.buildLimbs(model, root)
 e.procedural = true
 puppet = {model = model, hum = hum, root = root, e = e, realRoot = realRoot, realHum = realHum,
 wasAnchored = realRoot.Anchored, origCF = origCF}
@@ -2778,11 +2779,11 @@ local p = pages["Камеры"]
 local g = grid(p, 70)
 gbtn(g, "+ Поставить камеру", addCam)
 B.smooth = gbtn(g, "", function() S.smooth = not S.smooth refreshButtons() end)
-B.markers = gbtn(g, "", function() S.markers = not S.markers refreshMarkers() refreshButtons() end)
+B.markers = gbtn(g, "", function() S.markers = not S.markers G.refreshMarkers() refreshButtons() end)
 gbtn(g, "Очистить все", function()
 S.cams = {}
 saveCams()
-refreshMarkers()
+G.refreshMarkers()
 rebuildCamList()
 end)
 local list = scroller(p, 78)
@@ -2797,7 +2798,7 @@ btn(row, "  [" .. i .. "] " .. c.name, function() gotoCam(i) end,
 btn(row, "X", function()
 table.remove(S.cams, i)
 saveCams()
-refreshMarkers()
+G.refreshMarkers()
 rebuildCamList()
 end, {Size = UDim2.fromOffset(26, 26), Position = UDim2.new(1, -26, 0, 0),
 BackgroundColor3 = Color3.fromRGB(150, 50, 50)})
@@ -2808,7 +2809,7 @@ do
 local p = pages["Мир"]
 local g = grid(p, 192)
 B.night = gbtn(g, "День <-> Ночь", toggleDayNight)
-gbtn(g, "Сбросить время", resetTime)
+gbtn(g, "Сбросить время", G.resetTime)
 B.hide = gbtn(g, "Скрыть игроков", function() toggleHide() end)
 B.hideSelf = gbtn(g, "", function()
 S.hideSelf = not S.hideSelf
@@ -2830,12 +2831,12 @@ end
 do
 local p = pages["Модели"]
 local g = grid(p, 250)
-gbtn(g, "На себя", applySelf)
-gbtn(g, "Снять с себя", clearSelf)
-gbtn(g, "На других игроков", applyOthers)
-gbtn(g, "Снять с других", clearOthers)
+gbtn(g, "На себя", G.applySelf)
+gbtn(g, "Снять с себя", G.clearSelf)
+gbtn(g, "На других игроков", G.applyOthers)
+gbtn(g, "Снять с других", G.clearOthers)
 gbtn(g, "Скопировать NPC", captureNPC)
-gbtn(g, "Удалить из списка", deleteSel)
+gbtn(g, "Удалить из списка", G.deleteSel)
 gbtn(g, "Убить ближайшего", killNearest)
 gbtn(g, "Убить выбранного", killSelected)
 gbtn(g, "Вернуть всех", reviveAll)
@@ -2847,7 +2848,7 @@ scanNPCs()
 rebuildNPCList()
 refreshButtons()
 end)
-gbtn(g, "Записать анимации (40с)", recordAttacks)
+gbtn(g, "Записать анимации (40с)", G.recordAttacks)
 B.killUI = gbtn(g, "", function() toggleKillUI() end)
 B.rip = gbtn(g, "", function() KILL_RIP = not KILL_RIP refreshButtons() end)
 local function box(placeholder, pos, size)
@@ -2860,8 +2861,8 @@ return b
 end
 local nameBox = box("Имя модели", UDim2.fromOffset(0, 256), UDim2.new(0.5, -3, 0, 24))
 local idBox = box("ID модели", UDim2.new(0.5, 3, 0, 256), UDim2.new(0.5, -3, 0, 24))
-gbtn(g, "ID атаки -> модель", function() setAttackId(idBox.Text) end)
-btn(p, "Добавить / привязать ID", function() addById(nameBox.Text, idBox.Text) end,
+gbtn(g, "ID атаки -> модель", function() G.setAttackId(idBox.Text) end)
+btn(p, "Добавить / привязать ID", function() G.addById(nameBox.Text, idBox.Text) end,
 {Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 284)})
 local list = scroller(p, 314)
 rebuildLibList = function()
@@ -3042,17 +3043,17 @@ genv.__CinePanelCleanup = function()
 exitAll()
 unbindSink()
 S.timeLock = false
-clearHide()
+G.clearHide()
 toggleGod(false)
 stopPuppet()
-for orig in pairs(fights) do endFight(orig) end
+for orig in pairs(fights) do G.endFight(orig) end
 pcall(function() RunService:UnbindFromRenderStep("CineShake") end)
 if fxGui then fxGui:Destroy() end
 reviveAll()
 if fxFolder then fxFolder:Destroy() end
 S.selfEntry, S.allEntry, S.swap, S.hideNPC = nil, nil, false, false
 for ch in pairs(skins) do removeSkin(ch) end
-vhClearAll()
+G.vhClearAll()
 for _, t in ipairs(swapTemplates) do
 if t.src then pcall(function() t.src:Destroy() end) end
 end
