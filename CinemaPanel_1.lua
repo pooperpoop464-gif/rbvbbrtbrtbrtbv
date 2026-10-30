@@ -134,6 +134,7 @@ night = false, timeLock = false, origTime = Lighting.ClockTime,
 god = false,
 hideNPC = false, swap = false, listPlayers = false, basicAnim = false,
 selfEntry = nil, allEntry = nil,
+hitPlayers = true,      -- атаковать (визуально) и игроков
 }
 local npcs = {}
 local puppet = nil          -- «кукла»: локальная копия персонажа (см. togglePuppet)
@@ -413,8 +414,10 @@ local c = S.cams[i]
 if not c then return end
 if S.mode ~= "free" then enterFree() end
 S.lock = false
+G.streamPos = nil
+G.streamAround(c.cf.Position)
 if S.smooth then
-S.tween = {from = getCam().CFrame, to = c.cf, t = 0, dur = 0.8, fov0 = S.fov, fov1 = c.fov or S.fov}
+S.tween = {from = getCam().CFrame, to = c.cf, t = 0, dur = math.clamp((c.cf.Position - getCam().CFrame.Position).Magnitude / 400, 0.8, 3), fov0 = S.fov, fov1 = c.fov or S.fov}
 else
 setFree(c.cf)
 S.fov = c.fov or S.fov
@@ -2073,36 +2076,114 @@ TweenService:Create(p, TweenInfo.new(life, Enum.EasingStyle.Quad, Enum.EasingDir
 {Transparency = 1, Size = Vector3.new(size * 0.25, size * 0.25, size * 0.25)}):Play()
 task.delay(life + 0.1, function() G.bits[p] = nil p:Destroy() end)
 end
-function G.disintegrate(model)
-local list, total, n, center = {}, 0, 0, Vector3.zero
+G.BLOOD = {Color3.fromRGB(150, 0, 10), Color3.fromRGB(110, 0, 8), Color3.fromRGB(190, 10, 20)}
+function G.bloodBurst(pos, n, power)
+local rnd = math.random
+for _ = 1, n do
+local dir = Vector3.new(rnd() - 0.5, rnd() * 0.9 + 0.1, rnd() - 0.5).Unit
+G.spawnBit(pos, G.BLOOD[rnd(#G.BLOOD)], dir * rnd(6, power) + Vector3.new(0, rnd(3, 9), 0),
+0.14 + rnd() * 0.26, 0.9 + rnd() * 1.2, false)
+end
+end
+-- лужа крови на земле под телом (растекается и потом исчезает)
+function G.bloodPuddle(pos)
+local rp = RaycastParams.new()
+rp.FilterType = Enum.RaycastFilterType.Exclude
+local ex = {G.getFx()}
+if lp.Character then ex[#ex + 1] = lp.Character end
+if skinFolder then ex[#ex + 1] = skinFolder end
+rp.FilterDescendantsInstances = ex
+local hit = workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -60, 0), rp)
+if not hit then return end
+local n = hit.Normal
+local base = CFrame.lookAt(hit.Position, hit.Position + n) * CFrame.Angles(0, math.pi / 2, 0)
+for i = 1, 8 do
+local s = (i == 1) and (3.5 + math.random() * 1.5) or (0.5 + math.random() * 1.6)
+local oy = (i == 1) and 0 or (math.random() - 0.5) * 6
+local oz = (i == 1) and 0 or (math.random() - 0.5) * 6
+local p = Instance.new("Part")
+p.Shape = Enum.PartType.Cylinder
+p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.Massless = true, false, false, false, true
+p.Material = Enum.Material.SmoothPlastic
+p.Color = G.BLOOD[math.random(#G.BLOOD)]
+p.Size = Vector3.new(0.04, 0.2, 0.2)
+p.CFrame = base * CFrame.new(0.02 + i * 0.002, oy, oz)
+p.Parent = G.getFx()
+TweenService:Create(p, TweenInfo.new(0.9 + math.random() * 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+{Size = Vector3.new(0.04, s, s)}):Play()
+task.delay(6 + math.random() * 2, function()
+pcall(function() TweenService:Create(p, TweenInfo.new(2.5), {Transparency = 1}):Play() end)
+task.delay(2.6, function() p:Destroy() end)
+end)
+end
+end
+-- поверженный NPC падает (замороженная копия заваливается от тебя), из тела брызжет кровь
+function G.fallDown(fake, root, away, dur)
+local cf, size = fake:GetBoundingBox()
+local feet = Vector3.new(cf.Position.X, cf.Position.Y - size.Y / 2, cf.Position.Z)
+local axis = Vector3.yAxis:Cross(away)
+if axis.Magnitude < 0.01 then return end
+axis = axis.Unit
+local base = fake:GetPivot()
+local t0 = os.clock()
+while fake.Parent do
+local a = math.min((os.clock() - t0) / dur, 1)
+fake:PivotTo(CFrame.new(feet) * CFrame.fromAxisAngle(axis, a * a * 1.45) * CFrame.new(-feet) * base)
+if math.random() < 0.7 then
+G.spawnBit(root.Position + Vector3.new(0, 0.5, 0), G.BLOOD[math.random(#G.BLOOD)],
+Vector3.new(math.random(-6, 6), math.random(2, 8), math.random(-6, 6)) + away * 3,
+0.15 + math.random() * 0.2, 0.8, false)
+end
+if a >= 1 then break end
+task.wait()
+end
+end
+-- распад на частицы: тело рассыпается волной сверху вниз, каждая часть даёт частицы + брызги крови
+function G.dissolve(model, dur)
+local list, total, center = {}, 0, Vector3.zero
 for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("BasePart") and d.Transparency < 0.9 then
 local vol = math.max(d.Size.X * d.Size.Y * d.Size.Z, 0.01)
 list[#list + 1] = {d, vol}
 total = total + vol
 center = center + d.Position
-n = n + 1
 end
 end
-if n == 0 then return end
-center = center / n
-local budget = 160
-for _, it in ipairs(list) do
-local d, vol = it[1], it[2]
-local cnt = math.clamp(math.floor(budget * vol / total + 0.5), 1, 24)
+if #list == 0 then return end
+center = center / #list
+table.sort(list, function(a, b) return a[1].Position.Y > b[1].Position.Y end)
+local t0 = os.clock()
+local i = 1
+while i <= #list and model.Parent do
+local upto = math.min(#list, math.floor((os.clock() - t0) / dur * #list) + 1)
+while i <= upto do
+local d, vol = list[i][1], list[i][2]
+i = i + 1
+if d.Parent then
+local cnt = math.clamp(math.floor(150 * vol / total + 0.5), 1, 20)
 for _ = 1, cnt do
 local off = Vector3.new((math.random() - 0.5) * d.Size.X, (math.random() - 0.5) * d.Size.Y,
 (math.random() - 0.5) * d.Size.Z)
 local pos = (d.CFrame * CFrame.new(off)).Position
 local dir = pos - center
 dir = dir.Magnitude > 0.05 and dir.Unit or Vector3.yAxis
-local vel = dir * math.random(10, 26) + Vector3.new(math.random(-4, 4), math.random(6, 16), math.random(-4, 4))
-G.spawnBit(pos, d.Color, vel, 0.25 + math.random() * 0.45, 1.0 + math.random() * 0.9, false)
+local vel = dir * math.random(8, 22) + Vector3.new(math.random(-4, 4), math.random(5, 14), math.random(-4, 4))
+local blood = math.random() < 0.4
+G.spawnBit(pos, blood and G.BLOOD[math.random(#G.BLOOD)] or d.Color, vel,
+0.2 + math.random() * 0.4, 1 + math.random() * 0.9, false)
 end
+G.bloodBurst(d.Position, 3, 18)
+d.Transparency = 1
+for _, c in ipairs(d:GetChildren()) do
+if c:IsA("Decal") or c:IsA("Texture") then c.Transparency = 1 end
+end
+end
+end
+task.wait()
 end
 end
 function G.startFight(orig)
-local clone = cloneModel(orig)
+local clone = cloneModel((skins[orig] and skins[orig].skin) or orig)
 if not clone then return nil end
 clone.Name = "CineFight"
 for _, d in ipairs(clone:GetDescendants()) do
@@ -2158,22 +2239,40 @@ end
 end)
 function G.finishKill(orig, f)
 fights[orig] = nil
-local clone = f.fake
-pcall(G.disintegrate, clone)
-pcall(function() clone:Destroy() end)
 local dummy = Instance.new("Folder")
 dummy.Name = "CineDeathDummy"
 dummy.Parent = G.getFx()
 deadChars[orig] = {fake = dummy}
 vhHide(orig, "dead")
 vhShow(orig, "fight")
+local sk = skins[orig]
+if sk then sk.dead = true end
 task.delay(KILL_RESPAWN, function()
 if deadChars[orig] and deadChars[orig].fake == dummy then reviveChar(orig) end
 end)
-pcall(deathFX)
+task.spawn(function()
+local clone, root = f.fake, f.root
+local ok, err = pcall(function()
+local myR = myRootPart()
+local away = myR and (root.Position - myR.Position) or Vector3.new(0, 0, -1)
+away = Vector3.new(away.X, 0, away.Z)
+away = away.Magnitude > 0.05 and away.Unit or Vector3.new(0, 0, -1)
+G.fallDown(clone, root, away, 0.55)      -- 1) падает, брызжет кровь
+if not clone.Parent then return end
+local pos = root.Position
+pcall(deathFX)                           -- 2) кровь на экране + тряска
+G.bloodBurst(pos + Vector3.new(0, 0.5, 0), 45, 28)
+G.bloodPuddle(pos)                       -- 3) лужа
+G.dissolve(clone, 0.9)                   -- 4) распад на частицы
+end)
+if not ok then warn("[CinePanel] death: " .. tostring(err)) end
+pcall(function() clone:Destroy() end)
+end)
 end
 local function landHit(orig)
-if not orig or deadChars[orig] or Players:GetPlayerFromCharacter(orig) then return end
+if not orig or deadChars[orig] then return end
+local pl = Players:GetPlayerFromCharacter(orig)
+if pl and (pl == lp or not S.hitPlayers) then return end
 local f = fights[orig] or G.startFight(orig)
 if not f then return end
 f.hits = f.hits + 1
@@ -2211,7 +2310,7 @@ end
 end
 local function isCandidate(m, h)
 return m and m:IsA("Model") and m ~= lp.Character and not isSkinModel(m) and not deadChars[m]
-and not fights[m] and not Players:GetPlayerFromCharacter(m)
+and not fights[m] and (S.hitPlayers or not Players:GetPlayerFromCharacter(m))
 and (not h:IsA("Humanoid") or h.Health > 0)
 end
 local toggleKillUI = function() end
@@ -2399,6 +2498,18 @@ if force then startPuppet() else stopPuppet() end
 end
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
+-- StreamingEnabled: сервер подгружает мир только вокруг персонажа. Просим подгрузить место, куда летит камера
+function G.streamAround(pos)
+if not workspace.StreamingEnabled or G.streaming then return end
+local now = os.clock()
+if G.streamPos and (G.streamPos - pos).Magnitude < 80 and now - (G.streamT or 0) < 4 then return end
+G.streamPos, G.streamT = pos, now
+G.streaming = true
+task.spawn(function()
+pcall(function() lp:RequestStreamAroundAsync(pos, 4) end)
+G.streaming = false
+end)
+end
 local function updateFree(dt)
 local cam = getCam()
 if S.tween then
@@ -2406,6 +2517,7 @@ local t = S.tween
 t.t = t.t + dt
 local a = math.min(t.t / t.dur, 1)
 local e = a * a * (3 - 2 * a)
+G.streamAround(t.to.Position)
 cam.CFrame = t.from:Lerp(t.to, e)
 S.fov = t.fov0 + (t.fov1 - t.fov0) * e
 if a >= 1 then
@@ -2425,6 +2537,7 @@ status("Цель пропала — Lock выключен")
 refreshButtons()
 end
 end
+G.streamAround(S.fpos)
 local move = Vector3.zero
 if not typing() then
 if UIS:IsKeyDown(K.W) then move = move + Vector3.new(0, 0, -1) end
@@ -2616,7 +2729,7 @@ elseif input.UserInputType == Enum.UserInputType.MouseWheel then
 if gp or S.mode == "none" then return end
 local z = input.Position.Z
 if S.mode == "free" then
-S.speed = math.clamp(S.speed * (1.15 ^ z), 2, 500)
+S.speed = math.clamp(S.speed * (1.15 ^ z), 2, 3000)
 elseif S.mode == "self" then
 S.sdist = math.clamp(S.sdist - z * 1.5, 2, 40)
 elseif S.view == "third" then
@@ -2807,8 +2920,8 @@ refreshButtons()
 end)
 gbtn(g, "FOV -", ACTIONS.FovDown)
 gbtn(g, "FOV +", ACTIONS.FovUp)
-gbtn(g, "Скорость камеры -", function() S.speed = math.clamp(S.speed / 1.3, 2, 500) refreshButtons() end)
-gbtn(g, "Скорость камеры +", function() S.speed = math.clamp(S.speed * 1.3, 2, 500) refreshButtons() end)
+gbtn(g, "Скорость камеры -", function() S.speed = math.clamp(S.speed / 1.3, 2, 3000) refreshButtons() end)
+gbtn(g, "Скорость камеры +", function() S.speed = math.clamp(S.speed * 1.3, 2, 3000) refreshButtons() end)
 B.god = gbtn(g, "Бессмертие", function() toggleGod() end)
 gbtn(g, "Вылечить себя", healSelf)
 B.puppet = gbtn(g, "", function() togglePuppet() end)
@@ -2837,6 +2950,7 @@ refreshButtons()
 end)
 gbtn(g, "Записать анимации (40с)", G.recordAttacks)
 B.killUI = gbtn(g, "", function() toggleKillUI() end)
+B.hitPl = gbtn(g, "", function() S.hitPlayers = not S.hitPlayers refreshButtons() end)
 local function box(placeholder, pos, size)
 local b = new("TextBox", {Size = size, Position = pos, PlaceholderText = placeholder, Text = "",
 ClearTextOnFocus = false, BackgroundColor3 = PANEL, TextColor3 = TXT,
@@ -2984,6 +3098,8 @@ B.hideNPC.Text = "Скрыть NPC: " .. (S.hideNPC and "ВКЛ" or "ВЫКЛ")
 B.swap.Text = "Игроки = NPC: " .. (S.swap and "ВКЛ" or "ВЫКЛ")
 B.listPlayers.Text = "Игроки в списке: " .. (S.listPlayers and "ДА" or "НЕТ")
 B.killUI.Text = "KILL UI: " .. (S.killUI ~= false and "ВКЛ" or "ВЫКЛ")
+mark(B.hitPl, S.hitPlayers)
+B.hitPl.Text = "Бить игроков: " .. (S.hitPlayers and "ДА" or "НЕТ")
 mark(B.basic, S.basicAnim)
 B.basic.Text = "Только базовая анимация: " .. (S.basicAnim and "ДА" or "НЕТ")
 mark(B.puppet, puppet ~= nil)
