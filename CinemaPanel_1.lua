@@ -72,6 +72,7 @@ God         = K.F10,
 HideNPCs    = K.Delete,
 PlayersAsNPC = K.End,
 CaptureNPC  = K.Home,
+CopySounds  = K.Insert,
 KillFront   = K.X,
 Puppet      = K.P,
 SelfView    = K.Backquote,
@@ -96,6 +97,7 @@ local KEY_LABELS = {
 {"HideNPCs", "Скрыть всех NPC (выбранный виден)"},
 {"PlayersAsNPC", "Игроки = модели NPC"},
 {"CaptureNPC", "Скопировать выбранного NPC"},
+{"CopySounds", "Скопировать звуки выбранного NPC"},
 {"KillFront", "KILL: убить NPC перед тобой"},
 {"Puppet", "Кукла (неуязвимость от NPC)"},
 {"SelfView", "3-е лицо за себя / куклу"},
@@ -134,7 +136,7 @@ night = false, timeLock = false, origTime = Lighting.ClockTime,
 god = false,
 hideNPC = false, swap = false, listPlayers = false, basicAnim = false,
 selfEntry = nil, allEntry = nil,
-hitPlayers = true,      -- атаковать (визуально) и игроков
+sfx = true,
 }
 local npcs = {}
 local puppet = nil          -- «кукла»: локальная копия персонажа (см. togglePuppet)
@@ -414,10 +416,8 @@ local c = S.cams[i]
 if not c then return end
 if S.mode ~= "free" then enterFree() end
 S.lock = false
-G.streamPos = nil
-G.streamAround(c.cf.Position)
 if S.smooth then
-S.tween = {from = getCam().CFrame, to = c.cf, t = 0, dur = math.clamp((c.cf.Position - getCam().CFrame.Position).Magnitude / 400, 0.8, 3), fov0 = S.fov, fov1 = c.fov or S.fov}
+S.tween = {from = getCam().CFrame, to = c.cf, t = 0, dur = 0.8, fov0 = S.fov, fov1 = c.fov or S.fov}
 else
 setFree(c.cf)
 S.fov = c.fov or S.fov
@@ -924,7 +924,7 @@ for _, e in ipairs(LIB) do
 if e.kind == "capture" then
 if e.desc then t[#t + 1] = {n = e.name, k = "capture", d = e.desc} end
 else
-t[#t + 1] = {n = e.name, k = "asset", id = e.id, an = e.anim, cl = e.clips}
+t[#t + 1] = {n = e.name, k = "asset", id = e.id, an = e.anim, cl = e.clips, sn = e.sounds}
 end
 end
 pcall(function() writefile(LIB_FILE, HttpService:JSONEncode(t)) end)
@@ -937,7 +937,8 @@ if okE and ex then
 local ok, t = pcall(function() return HttpService:JSONDecode(readfile(LIB_FILE)) end)
 if ok and type(t) == "table" then
 for _, e in ipairs(t) do
-table.insert(LIB, {name = e.n, kind = e.k, id = e.id, desc = e.d, anim = (e.d and e.d.anim) or e.an, clips = (e.d and e.d.clips) or e.cl})
+table.insert(LIB, {name = e.n, kind = e.k, id = e.id, desc = e.d, anim = (e.d and e.d.anim) or e.an,
+clips = (e.d and e.d.clips) or e.cl, sounds = (e.d and e.d.snd) or e.sn})
 end
 end
 end
@@ -949,6 +950,194 @@ if e.name == nm then found = true break end
 end
 if not found then table.insert(LIB, {name = nm, kind = "asset"}) end
 end
+end
+-- ===================== ЗВУКИ + ключи суставов =====================
+-- ключи суставов: новый (Имя|Part0>Part1#N) и старый (Имя#N, для ранее сохранённых клипов)
+function G.motorKeys(model)
+local out, cnt, cntOld = {}, {}, {}
+for _, d in ipairs(model:GetDescendants()) do
+if d:IsA("Motor6D") then
+local base = d.Name .. "|" .. (d.Part0 and d.Part0.Name or "?") .. ">" .. (d.Part1 and d.Part1.Name or "?")
+cnt[base] = (cnt[base] or 0) + 1
+cntOld[d.Name] = (cntOld[d.Name] or 0) + 1
+out[#out + 1] = {d, base .. "#" .. cnt[base], d.Name .. "#" .. cntOld[d.Name]}
+end
+end
+return out
+end
+-- скорость по смещению корня (работает и для NPC, которых двигают твином/CFrame)
+function G.speedTracker()
+local last, lt
+return function(root)
+local now, p = os.clock(), root.Position
+local sp = 0
+if last and now > lt then
+local d = p - last
+sp = math.min(Vector3.new(d.X, 0, d.Z).Magnitude / (now - lt), 80)
+end
+last, lt = p, now
+local v = root.AssemblyLinearVelocity
+return math.max(sp, Vector3.new(v.X, 0, v.Z).Magnitude)
+end
+end
+-- мгновенный снимок позы: копия не стоит в T-позе, пока идёт запись
+function G.snapshotPose(model, entry)
+if entry.clips then return end
+local keys, fr = {}, {}
+local function r3(x) return math.floor(x * 1000 + 0.5) / 1000 end
+for _, it in ipairs(G.motorKeys(model)) do
+local cf = it[1].Transform
+local ps = cf.Position
+local rx, ry, rz = cf:ToEulerAnglesYXZ()
+keys[#keys + 1] = it[2]
+local n = #fr
+fr[n + 1], fr[n + 2], fr[n + 3] = r3(ps.X), r3(ps.Y), r3(ps.Z)
+fr[n + 4], fr[n + 5], fr[n + 6] = r3(rx), r3(ry), r3(rz)
+end
+if #keys == 0 then return end
+entry.clips = {keys = keys, idle = {f = {fr, fr}, sp = 0}}
+entry._dec = nil
+end
+function G.classifySound(name)
+local n = string.lower(name or "")
+local function has(list)
+for _, w in ipairs(list) do
+if n:find(w, 1, true) then return true end
+end
+return false
+end
+if has({"death", "die", "dead"}) then return "death" end
+if has({"hit", "hurt", "pain", "punch", "impact", "damage", "ouch", "oof"}) then return "hit" end
+if has({"attack", "swing", "slash", "bite", "grab", "kill", "scream", "roar", "screech",
+"jumpscare", "growl", "shout", "swipe", "whoosh", "lunge", "chase"}) then return "attack" end
+if has({"step", "foot", "walk", "run", "jump", "land"}) then return "step" end
+if has({"idle", "ambient", "breath", "music", "loop", "theme", "hum"}) then return "idle" end
+return "other"
+end
+function G.addSound(entry, s, cat)
+if not s or s.SoundId == "" then return end
+entry.sounds = entry.sounds or {}
+for _, x in ipairs(entry.sounds) do
+if x.id == s.SoundId then
+if cat == "attack" and x.cat == "other" then x.cat = "attack" end
+return
+end
+end
+if #entry.sounds >= 40 then return end
+table.insert(entry.sounds, {id = s.SoundId, name = s.Name, cat = cat or G.classifySound(s.Name),
+vol = s.Volume, spd = s.PlaybackSpeed, loop = s.Looped})
+end
+function G.readSounds(model, entry)
+entry.sounds = entry.sounds or {}
+for _, d in ipairs(model:GetDescendants()) do
+if d:IsA("Sound") then G.addSound(entry, d) end
+end
+end
+G.SFX_FB = {attack = {"attack"}, hit = {"hit"}, death = {"death", "hit"}}
+G.DEFAULT_ATTACK = "rbxasset://sounds/swordslash.wav" -- запасной звук, если у модели нет своих
+function G.playSfxAt(entry, cat, pos, vol, useDefault)
+if not S.sfx then return false end
+local x
+if entry and entry.sounds then
+for _, c in ipairs(G.SFX_FB[cat] or {cat}) do
+local list = {}
+for _, s in ipairs(entry.sounds) do
+if s.cat == c then list[#list + 1] = s end
+end
+if #list > 0 then x = list[math.random(#list)] break end
+end
+end
+if not x and useDefault then x = {id = G.DEFAULT_ATTACK, vol = 0.8, spd = 1} end
+if not x then return false end
+local ok = pcall(function()
+local part = Instance.new("Part")
+part.Anchored, part.CanCollide, part.CanTouch, part.CanQuery = true, false, false, false
+part.Transparency = 1
+part.Size = Vector3.new(0.2, 0.2, 0.2)
+part.Position = pos
+part.Parent = G.getFx()
+local snd = Instance.new("Sound")
+snd.SoundId = x.id
+snd.Volume = math.clamp((x.vol or 1) * (vol or 1), 0, 10)
+snd.PlaybackSpeed = (x.spd and x.spd > 0) and x.spd or 1
+snd.Looped = false
+snd.RollOffMaxDistance = 150
+snd.Parent = part
+snd:Play()
+game:GetService("Debris"):AddItem(part, 10)
+end)
+return ok
+end
+function G.isAttacking(model)
+for _, t in ipairs(G.livePlayingIds(model)) do
+local nm = string.lower(t.name or "")
+if (not t.looped) or nm:find("attack") or nm:find("kill") or nm:find("grab")
+or nm:find("slash") or nm:find("bite") or nm:find("hit") or nm:find("swing") then
+return true
+end
+end
+return false
+end
+function G.sfxSave(entry)
+if entry.desc then entry.desc.snd = entry.sounds end
+saveLib()
+end
+-- слушает звуки NPC (и новые, создаваемые рядом) и раскладывает по категориям
+function G.observeSounds(model, entry, duration)
+task.spawn(function()
+entry.sounds = entry.sounds or {}
+local watched, cons = {}, {}
+local function cat() return G.isAttacking(model) and "attack" or nil end
+local function watch(s)
+if watched[s] then return end
+watched[s] = true
+table.insert(cons, s.Played:Connect(function() G.addSound(entry, s, cat()) end))
+end
+for _, d in ipairs(model:GetDescendants()) do
+if d:IsA("Sound") then watch(d) end
+end
+table.insert(cons, model.DescendantAdded:Connect(function(d)
+if d:IsA("Sound") then
+watch(d)
+task.defer(function() if d.IsPlaying then G.addSound(entry, d, cat()) end end)
+end
+end))
+table.insert(cons, workspace.DescendantAdded:Connect(function(d)
+if d:IsA("Sound") and not isSkinModel(d.Parent or workspace) then
+local r = rootOf(model)
+local part = d.Parent and d.Parent:IsA("BasePart") and d.Parent
+if r and part and (part.Position - r.Position).Magnitude < 60 then
+watch(d)
+task.defer(function() if d.IsPlaying then G.addSound(entry, d, cat()) end end)
+end
+end
+end))
+local t0 = os.clock()
+while os.clock() - t0 < duration and model.Parent do
+for s in pairs(watched) do
+if s.Parent and s.IsPlaying then G.addSound(entry, s, cat()) end
+end
+task.wait(0.2)
+end
+for _, c in ipairs(cons) do c:Disconnect() end
+G.sfxSave(entry)
+local n = {attack = 0, hit = 0, death = 0}
+for _, x in ipairs(entry.sounds) do
+if n[x.cat] then n[x.cat] = n[x.cat] + 1 end
+end
+status(string.format("Звуки: всего %d (атака %d, удар %d, смерть %d)", #entry.sounds, n.attack, n.hit, n.death))
+end)
+end
+-- кнопка / Insert: скопировать звуки выбранного NPC в выбранную модель библиотеки
+function G.copySounds()
+local m = S.target
+if not (m and m.Parent) then status("Выбери NPC во вкладке NPC") return end
+local e = libSel
+if not e then status("Выбери модель в списке (вкладка «Модели»)") return end
+G.readSounds(m, e)
+G.sfxSave(e)
+G.observeSounds(m, e, 25)
+status("Копирую звуки с «" .. m.Name .. "» 25 с: пусть NPC атакует/кричит")
 end
 local function getSource(entry)
 if entry.src and entry.src.Parent == nil then return entry.src end
@@ -968,6 +1157,7 @@ end
 if src then
 entry.src = src
 entry.failT = nil
+if not entry.sounds then pcall(G.readSounds, src, entry) end
 if not entry.anim or next(entry.anim) == nil then
 local a = readAnimIds(src)
 if next(a) then entry.anim = a end
@@ -1304,13 +1494,10 @@ end
 return entry._dec or nil
 end
 function G.buildClipMotors(model, dec)
-local list, cnt = {}, {}
-for _, d in ipairs(model:GetDescendants()) do
-if d:IsA("Motor6D") then
-cnt[d.Name] = (cnt[d.Name] or 0) + 1
-local j = dec.keyIndex[d.Name .. "#" .. cnt[d.Name]]
-if j then list[#list + 1] = {d, j} end
-end
+local list = {}
+for _, it in ipairs(G.motorKeys(model)) do
+local j = dec.keyIndex[it[2]] or dec.keyIndex[it[3]]
+if j then list[#list + 1] = {it[1], j} end
 end
 return list
 end
@@ -1342,6 +1529,7 @@ end
 local want = "idle"
 if e.moving then want = (e.sm > 18) and "run" or "walk" end
 local useRecorded = not (S.basicAnim and e.limbs and #e.limbs > 0)
+local lackMove = false -- нет записи ходьбы -> процедурная ходьба вместо скольжения в позе idle
 local cl = e.clips
 if useRecorded and cl and e.cm and #e.cm > 0 then
 if e.atkT0 and cl.attack then
@@ -1352,7 +1540,7 @@ return true
 end
 e.atkT0 = nil
 end
-local order = (want == "run" and {"run", "walk", "idle"}) or (want == "walk" and {"walk", "run", "idle"}) or {"idle"}
+local order = (want == "run" and {"run", "walk"}) or (want == "walk" and {"walk", "run"}) or {"idle"}
 local c
 for _, k in ipairs(order) do
 if cl[k] then c = cl[k] break end
@@ -1363,6 +1551,8 @@ if want ~= "idle" and c.sp and c.sp > 0.5 then scale = math.clamp(e.sm / c.sp, 0
 e.ct = (e.ct or 0) + dt * scale
 G.applyClip(e, c, e.ct, true)
 return true
+elseif want ~= "idle" then
+lackMove = true
 end
 end
 if e.tracks then
@@ -1378,8 +1568,11 @@ if useRecorded and e.tracks then
 local w = want
 if not e.tracks[w] then
 w = (w == "run" and e.tracks.walk and "walk") or (w == "walk" and e.tracks.run and "run")
-or (e.tracks.idle and "idle") or nil
+or (w == "idle" and e.tracks.idle and "idle") or nil
 end
+if w == nil and want ~= "idle" then lackMove = true end
+if not lackMove or w then
+lackMove = false
 if w ~= e.state then
 for k, tr in pairs(e.tracks) do
 if k ~= w and tr.IsPlaying then tr:Stop(0.2) end
@@ -1392,7 +1585,8 @@ pcall(function() e.tracks[w]:AdjustSpeed(math.clamp(e.sm / 14, 0.4, 2.5)) end)
 end
 return true
 end
-if e.limbs and #e.limbs > 0 and (e.procedural or S.basicAnim) then
+end
+if e.limbs and #e.limbs > 0 and (e.procedural or S.basicAnim or lackMove) then
 if e.tracks then
 for _, tr in pairs(e.tracks) do
 if tr.IsPlaying then tr:Stop(0.1) end
@@ -1470,6 +1664,10 @@ local sg = armDown[d]
 if o or sg then pairsList[#pairsList + 1] = {d, o, sg} end
 end
 end
+local totalMotors = 0
+for _, d in ipairs(skin:GetDescendants()) do
+if d:IsA("Motor6D") then totalMotors = totalMotors + 1 end
+end
 local matched = 0
 for _, pr in ipairs(pairsList) do
 if pr[2] then matched = matched + 1 end
@@ -1480,7 +1678,7 @@ vhHide(char, "skin")
 skins[char] = {skin = skin, root = root, origRoot = origRoot, offY = offY,
 motors = pairsList, fb = pairsList, tracks = tracks, attack = attackTr, t0 = os.clock(),
 clips = dec, cm = dec and G.buildClipMotors(skin, dec) or {}, arms = arms,
-limbs = G.buildLimbs(skin, root), procedural = (matched == 0),
+limbs = G.buildLimbs(skin, root), procedural = (matched < math.max(1, math.floor(totalMotors * 0.6))),
 isPlayer = Players:GetPlayerFromCharacter(char) ~= nil, entry = entry, parked = false}
 task.delay(1.5, function()
 local cur = skins[char]
@@ -1735,15 +1933,13 @@ rebuildLibList()
 status("Удалено: " .. e.name)
 end
 function G.observeAnims(model, entry, duration)
+G.observeSounds(model, entry, duration)
 task.spawn(function()
 entry.anim = entry.anim or {}
-local keys, motors, cnt = {}, {}, {}
-for _, d in ipairs(model:GetDescendants()) do
-if d:IsA("Motor6D") then
-cnt[d.Name] = (cnt[d.Name] or 0) + 1
-keys[#keys + 1] = d.Name .. "#" .. cnt[d.Name]
-motors[#motors + 1] = d
-end
+local motors, keys = {}, {}
+for _, it in ipairs(G.motorKeys(model)) do
+motors[#motors + 1] = it[1]
+keys[#keys + 1] = it[2]
 end
 local function r3(x) return math.floor(x * 1000 + 0.5) / 1000 end
 local function sample()
@@ -1760,12 +1956,12 @@ return fr
 end
 local LIM = {idle = 3, walk = 2.4, run = 2, attack = 3.5}
 local rec, prev, smooth, moving = {}, nil, 0, false
+local speedOf = G.speedTracker()
 local t0 = os.clock()
 while os.clock() - t0 < duration and model.Parent do
 local r = rootOf(model)
 if r then
-local v = r.AssemblyLinearVelocity
-local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+local sp = speedOf(r)
 smooth = smooth * 0.6 + sp * 0.4
 if moving then
 if smooth < 1.2 then moving = false end
@@ -1817,14 +2013,25 @@ end
 end
 task.wait(1 / CLIP_FPS)
 end
+-- объединяем с прошлой записью (если набор суставов тот же), а не стираем её
 local clips, got = {keys = keys}, {}
+local old = entry.clips
+if old and old.keys and #old.keys == #keys then
+local same = true
+for i, k in ipairs(keys) do
+if old.keys[i] ~= k then same = false break end
+end
+if same then
+for _, st in ipairs({"idle", "walk", "run", "attack"}) do clips[st] = old[st] end
+end
+end
 for st, c in pairs(rec) do
 if #c.f >= 6 then
 clips[st] = {f = c.f, sp = c.nsp > 0 and r3(c.sps / c.nsp) or 0}
 got[#got + 1] = st
 end
 end
-if #got > 0 then
+if #got > 0 or clips.idle then
 entry.clips = clips
 entry._dec = nil
 if entry.desc then entry.desc.clips = clips end
@@ -1894,14 +2101,21 @@ end
 local entry = {name = name, kind = "capture", src = src, desc = ok and desc or nil}
 entry.orig = m
 entry.anim = readAnimIds(m)
-if entry.desc then entry.desc.anim = entry.anim end
-G.observeAnims(m, entry, 20)
+entry.sounds = {}
+pcall(G.readSounds, m, entry)
+pcall(G.snapshotPose, m, entry)
+if entry.desc then
+entry.desc.anim = entry.anim
+entry.desc.snd = entry.sounds
+if entry.clips then entry.desc.clips = entry.clips end
+end
+G.observeAnims(m, entry, 30)
 table.insert(LIB, entry)
 libSel = entry
 saveLib()
 rebuildLibList()
 status("Скопировано: " .. name .. (entry.desc and (writefile and " (в файл)" or "") or " (только сессия)")
-.. ". Запоминаю анимации 20 с — пусть NPC постоит и пройдётся")
+.. ". Запоминаю анимации и звуки 30 с — пусть NPC постоит, пройдётся и атакует")
 end
 function G.addById(nameText, idText)
 local id = tonumber((idText or ""):match("%d+"))
@@ -1923,7 +2137,7 @@ rebuildLibList()
 status("Добавлено: " .. name .. " (ID " .. id .. ")")
 end
 -- ===================== KILL (единственный вариант атаки: X / кнопка KILL) =====================
--- Всё делается ТОЛЬКО на твоём клиенте: копия NPC, частицы, кровь, тряска. Серверу и другим игрокам ничего не отправляется.
+-- Всё делается ТОЛЬКО на твоём клиенте: копия NPC, частицы, кровь, тряска, звуки. Серверу и другим игрокам ничего не отправляется.
 local KILL_RESPAWN = 8      -- через сколько секунд NPC «возвращается»
 local fxFolder
 local deadChars = {}
@@ -2076,114 +2290,36 @@ TweenService:Create(p, TweenInfo.new(life, Enum.EasingStyle.Quad, Enum.EasingDir
 {Transparency = 1, Size = Vector3.new(size * 0.25, size * 0.25, size * 0.25)}):Play()
 task.delay(life + 0.1, function() G.bits[p] = nil p:Destroy() end)
 end
-G.BLOOD = {Color3.fromRGB(150, 0, 10), Color3.fromRGB(110, 0, 8), Color3.fromRGB(190, 10, 20)}
-function G.bloodBurst(pos, n, power)
-local rnd = math.random
-for _ = 1, n do
-local dir = Vector3.new(rnd() - 0.5, rnd() * 0.9 + 0.1, rnd() - 0.5).Unit
-G.spawnBit(pos, G.BLOOD[rnd(#G.BLOOD)], dir * rnd(6, power) + Vector3.new(0, rnd(3, 9), 0),
-0.14 + rnd() * 0.26, 0.9 + rnd() * 1.2, false)
-end
-end
--- лужа крови на земле под телом (растекается и потом исчезает)
-function G.bloodPuddle(pos)
-local rp = RaycastParams.new()
-rp.FilterType = Enum.RaycastFilterType.Exclude
-local ex = {G.getFx()}
-if lp.Character then ex[#ex + 1] = lp.Character end
-if skinFolder then ex[#ex + 1] = skinFolder end
-rp.FilterDescendantsInstances = ex
-local hit = workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -60, 0), rp)
-if not hit then return end
-local n = hit.Normal
-local base = CFrame.lookAt(hit.Position, hit.Position + n) * CFrame.Angles(0, math.pi / 2, 0)
-for i = 1, 8 do
-local s = (i == 1) and (3.5 + math.random() * 1.5) or (0.5 + math.random() * 1.6)
-local oy = (i == 1) and 0 or (math.random() - 0.5) * 6
-local oz = (i == 1) and 0 or (math.random() - 0.5) * 6
-local p = Instance.new("Part")
-p.Shape = Enum.PartType.Cylinder
-p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.Massless = true, false, false, false, true
-p.Material = Enum.Material.SmoothPlastic
-p.Color = G.BLOOD[math.random(#G.BLOOD)]
-p.Size = Vector3.new(0.04, 0.2, 0.2)
-p.CFrame = base * CFrame.new(0.02 + i * 0.002, oy, oz)
-p.Parent = G.getFx()
-TweenService:Create(p, TweenInfo.new(0.9 + math.random() * 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-{Size = Vector3.new(0.04, s, s)}):Play()
-task.delay(6 + math.random() * 2, function()
-pcall(function() TweenService:Create(p, TweenInfo.new(2.5), {Transparency = 1}):Play() end)
-task.delay(2.6, function() p:Destroy() end)
-end)
-end
-end
--- поверженный NPC падает (замороженная копия заваливается от тебя), из тела брызжет кровь
-function G.fallDown(fake, root, away, dur)
-local cf, size = fake:GetBoundingBox()
-local feet = Vector3.new(cf.Position.X, cf.Position.Y - size.Y / 2, cf.Position.Z)
-local axis = Vector3.yAxis:Cross(away)
-if axis.Magnitude < 0.01 then return end
-axis = axis.Unit
-local base = fake:GetPivot()
-local t0 = os.clock()
-while fake.Parent do
-local a = math.min((os.clock() - t0) / dur, 1)
-fake:PivotTo(CFrame.new(feet) * CFrame.fromAxisAngle(axis, a * a * 1.45) * CFrame.new(-feet) * base)
-if math.random() < 0.7 then
-G.spawnBit(root.Position + Vector3.new(0, 0.5, 0), G.BLOOD[math.random(#G.BLOOD)],
-Vector3.new(math.random(-6, 6), math.random(2, 8), math.random(-6, 6)) + away * 3,
-0.15 + math.random() * 0.2, 0.8, false)
-end
-if a >= 1 then break end
-task.wait()
-end
-end
--- распад на частицы: тело рассыпается волной сверху вниз, каждая часть даёт частицы + брызги крови
-function G.dissolve(model, dur)
-local list, total, center = {}, 0, Vector3.zero
+function G.disintegrate(model)
+local list, total, n, center = {}, 0, 0, Vector3.zero
 for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("BasePart") and d.Transparency < 0.9 then
 local vol = math.max(d.Size.X * d.Size.Y * d.Size.Z, 0.01)
 list[#list + 1] = {d, vol}
 total = total + vol
 center = center + d.Position
+n = n + 1
 end
 end
-if #list == 0 then return end
-center = center / #list
-table.sort(list, function(a, b) return a[1].Position.Y > b[1].Position.Y end)
-local t0 = os.clock()
-local i = 1
-while i <= #list and model.Parent do
-local upto = math.min(#list, math.floor((os.clock() - t0) / dur * #list) + 1)
-while i <= upto do
-local d, vol = list[i][1], list[i][2]
-i = i + 1
-if d.Parent then
-local cnt = math.clamp(math.floor(150 * vol / total + 0.5), 1, 20)
+if n == 0 then return end
+center = center / n
+local budget = 160
+for _, it in ipairs(list) do
+local d, vol = it[1], it[2]
+local cnt = math.clamp(math.floor(budget * vol / total + 0.5), 1, 24)
 for _ = 1, cnt do
 local off = Vector3.new((math.random() - 0.5) * d.Size.X, (math.random() - 0.5) * d.Size.Y,
 (math.random() - 0.5) * d.Size.Z)
 local pos = (d.CFrame * CFrame.new(off)).Position
 local dir = pos - center
 dir = dir.Magnitude > 0.05 and dir.Unit or Vector3.yAxis
-local vel = dir * math.random(8, 22) + Vector3.new(math.random(-4, 4), math.random(5, 14), math.random(-4, 4))
-local blood = math.random() < 0.4
-G.spawnBit(pos, blood and G.BLOOD[math.random(#G.BLOOD)] or d.Color, vel,
-0.2 + math.random() * 0.4, 1 + math.random() * 0.9, false)
+local vel = dir * math.random(10, 26) + Vector3.new(math.random(-4, 4), math.random(6, 16), math.random(-4, 4))
+G.spawnBit(pos, d.Color, vel, 0.25 + math.random() * 0.45, 1.0 + math.random() * 0.9, false)
 end
-G.bloodBurst(d.Position, 3, 18)
-d.Transparency = 1
-for _, c in ipairs(d:GetChildren()) do
-if c:IsA("Decal") or c:IsA("Texture") then c.Transparency = 1 end
-end
-end
-end
-task.wait()
 end
 end
 function G.startFight(orig)
-local clone = cloneModel((skins[orig] and skins[orig].skin) or orig)
+local clone = cloneModel(orig)
 if not clone then return nil end
 clone.Name = "CineFight"
 for _, d in ipairs(clone:GetDescendants()) do
@@ -2209,6 +2345,9 @@ local root = rootOf(clone)
 if not root then clone:Destroy() return nil end
 vhHide(orig, "fight")
 local f = {fake = clone, root = root, hits = 0, last = os.clock()}
+-- звуки самого NPC берём с оригинала (у клона Sound удалены)
+f.snd = {sounds = {}}
+pcall(G.readSounds, orig, f.snd)
 fights[orig] = f
 return f
 end
@@ -2239,45 +2378,39 @@ end
 end)
 function G.finishKill(orig, f)
 fights[orig] = nil
+local clone = f.fake
+pcall(function()
+local p = f.root.Position
+if not G.playSfxAt(f.snd, "death", p, 1) then
+local ae = (puppet and puppet.e) or (lp.Character and skins[lp.Character])
+G.playSfxAt(ae and ae.entry or nil, "death", p, 1)
+end
+end)
+pcall(G.disintegrate, clone)
+pcall(function() clone:Destroy() end)
 local dummy = Instance.new("Folder")
 dummy.Name = "CineDeathDummy"
 dummy.Parent = G.getFx()
 deadChars[orig] = {fake = dummy}
 vhHide(orig, "dead")
 vhShow(orig, "fight")
-local sk = skins[orig]
-if sk then sk.dead = true end
 task.delay(KILL_RESPAWN, function()
 if deadChars[orig] and deadChars[orig].fake == dummy then reviveChar(orig) end
 end)
-task.spawn(function()
-local clone, root = f.fake, f.root
-local ok, err = pcall(function()
-local myR = myRootPart()
-local away = myR and (root.Position - myR.Position) or Vector3.new(0, 0, -1)
-away = Vector3.new(away.X, 0, away.Z)
-away = away.Magnitude > 0.05 and away.Unit or Vector3.new(0, 0, -1)
-G.fallDown(clone, root, away, 0.55)      -- 1) падает, брызжет кровь
-if not clone.Parent then return end
-local pos = root.Position
-pcall(deathFX)                           -- 2) кровь на экране + тряска
-G.bloodBurst(pos + Vector3.new(0, 0.5, 0), 45, 28)
-G.bloodPuddle(pos)                       -- 3) лужа
-G.dissolve(clone, 0.9)                   -- 4) распад на частицы
-end)
-if not ok then warn("[CinePanel] death: " .. tostring(err)) end
-pcall(function() clone:Destroy() end)
-end)
+pcall(deathFX)
 end
 local function landHit(orig)
-if not orig or deadChars[orig] then return end
-local pl = Players:GetPlayerFromCharacter(orig)
-if pl and (pl == lp or not S.hitPlayers) then return end
+if not orig or deadChars[orig] or Players:GetPlayerFromCharacter(orig) then return end
 local f = fights[orig] or G.startFight(orig)
 if not f then return end
 f.hits = f.hits + 1
 f.last = os.clock()
 local pos = f.root.Position + Vector3.new(0, 1, 0)
+pcall(function()
+local ae = (puppet and puppet.e) or (lp.Character and skins[lp.Character])
+G.playSfxAt(f.snd, "hit", pos, 1)
+G.playSfxAt(ae and ae.entry or nil, "hit", pos, 0.9)
+end)
 for _ = 1, 10 do -- искры от удара
 G.spawnBit(pos, Color3.fromRGB(255, 235, 170), Vector3.new(math.random(-14, 14), math.random(4, 14), math.random(-14, 14)),
 0.2 + math.random() * 0.15, 0.4, true)
@@ -2310,7 +2443,7 @@ end
 end
 local function isCandidate(m, h)
 return m and m:IsA("Model") and m ~= lp.Character and not isSkinModel(m) and not deadChars[m]
-and not fights[m] and (S.hitPlayers or not Players:GetPlayerFromCharacter(m))
+and not fights[m] and not Players:GetPlayerFromCharacter(m)
 and (not h:IsA("Humanoid") or h.Health > 0)
 end
 local toggleKillUI = function() end
@@ -2372,6 +2505,9 @@ elseif e then
 e.faceDir, e.faceT = flat, os.clock() + 0.8
 end
 end
+pcall(function()
+G.playSfxAt(e and e.entry or nil, "attack", myRoot and myRoot.Position or cf.Position, 1, true)
+end)
 local delay = 0.16
 if e then
 e.punchSide = ((e.punchSide or -1) == 1) and -1 or 1 -- удары чередуем: правая/левая рука
@@ -2445,6 +2581,7 @@ model.Name = "CinePuppet"
 model.Parent = getSkinFolder()
 pcall(function() model:PivotTo(origCF) end)
 local e = {skin = model, root = root, t0 = os.clock(), motors = {}, fb = {}}
+e.entry = entry
 e.tracks, e.attack = G.setupTracks(model, {anim = animIds})
 local dec = G.entryClips(entry)
 e.clips = dec
@@ -2498,18 +2635,6 @@ if force then startPuppet() else stopPuppet() end
 end
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
--- StreamingEnabled: сервер подгружает мир только вокруг персонажа. Просим подгрузить место, куда летит камера
-function G.streamAround(pos)
-if not workspace.StreamingEnabled or G.streaming then return end
-local now = os.clock()
-if G.streamPos and (G.streamPos - pos).Magnitude < 80 and now - (G.streamT or 0) < 4 then return end
-G.streamPos, G.streamT = pos, now
-G.streaming = true
-task.spawn(function()
-pcall(function() lp:RequestStreamAroundAsync(pos, 4) end)
-G.streaming = false
-end)
-end
 local function updateFree(dt)
 local cam = getCam()
 if S.tween then
@@ -2517,7 +2642,6 @@ local t = S.tween
 t.t = t.t + dt
 local a = math.min(t.t / t.dur, 1)
 local e = a * a * (3 - 2 * a)
-G.streamAround(t.to.Position)
 cam.CFrame = t.from:Lerp(t.to, e)
 S.fov = t.fov0 + (t.fov1 - t.fov0) * e
 if a >= 1 then
@@ -2537,7 +2661,6 @@ status("Цель пропала — Lock выключен")
 refreshButtons()
 end
 end
-G.streamAround(S.fpos)
 local move = Vector3.zero
 if not typing() then
 if UIS:IsKeyDown(K.W) then move = move + Vector3.new(0, 0, -1) end
@@ -2669,6 +2792,7 @@ God = function() toggleGod() end,
 HideNPCs = function() toggleHideNPC() end,
 PlayersAsNPC = function() toggleSwap() end,
 CaptureNPC = captureNPC,
+CopySounds = function() G.copySounds() end,
 KillFront = function() pressKillFX() killFront() end,
 Puppet = function() togglePuppet() end,
 SelfView = function() if S.mode == "self" then exitAll() else G.enterSelf() end end,
@@ -2729,7 +2853,7 @@ elseif input.UserInputType == Enum.UserInputType.MouseWheel then
 if gp or S.mode == "none" then return end
 local z = input.Position.Z
 if S.mode == "free" then
-S.speed = math.clamp(S.speed * (1.15 ^ z), 2, 3000)
+S.speed = math.clamp(S.speed * (1.15 ^ z), 2, 500)
 elseif S.mode == "self" then
 S.sdist = math.clamp(S.sdist - z * 1.5, 2, 40)
 elseif S.view == "third" then
@@ -2909,7 +3033,7 @@ end
 end
 do
 local p = pages["Мир"]
-local g = grid(p, 192)
+local g = grid(p, 218)
 B.night = gbtn(g, "День <-> Ночь", toggleDayNight)
 gbtn(g, "Сбросить время", G.resetTime)
 B.hide = gbtn(g, "Скрыть игроков", function() toggleHide() end)
@@ -2920,13 +3044,15 @@ refreshButtons()
 end)
 gbtn(g, "FOV -", ACTIONS.FovDown)
 gbtn(g, "FOV +", ACTIONS.FovUp)
-gbtn(g, "Скорость камеры -", function() S.speed = math.clamp(S.speed / 1.3, 2, 3000) refreshButtons() end)
-gbtn(g, "Скорость камеры +", function() S.speed = math.clamp(S.speed * 1.3, 2, 3000) refreshButtons() end)
+gbtn(g, "Скорость камеры -", function() S.speed = math.clamp(S.speed / 1.3, 2, 500) refreshButtons() end)
+gbtn(g, "Скорость камеры +", function() S.speed = math.clamp(S.speed * 1.3, 2, 500) refreshButtons() end)
 B.god = gbtn(g, "Бессмертие", function() toggleGod() end)
 gbtn(g, "Вылечить себя", healSelf)
 B.puppet = gbtn(g, "", function() togglePuppet() end)
 B.basic = gbtn(g, "", function() S.basicAnim = not S.basicAnim refreshButtons() end)
-B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 198),
+B.sfx = gbtn(g, "", function() S.sfx = not S.sfx refreshButtons() end)
+gbtn(g, "Копировать звуки NPC", G.copySounds)
+B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 226),
 BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
 TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
 end
@@ -2950,7 +3076,6 @@ refreshButtons()
 end)
 gbtn(g, "Записать анимации (40с)", G.recordAttacks)
 B.killUI = gbtn(g, "", function() toggleKillUI() end)
-B.hitPl = gbtn(g, "", function() S.hitPlayers = not S.hitPlayers refreshButtons() end)
 local function box(placeholder, pos, size)
 local b = new("TextBox", {Size = size, Position = pos, PlaceholderText = placeholder, Text = "",
 ClearTextOnFocus = false, BackgroundColor3 = PANEL, TextColor3 = TXT,
@@ -3098,10 +3223,10 @@ B.hideNPC.Text = "Скрыть NPC: " .. (S.hideNPC and "ВКЛ" or "ВЫКЛ")
 B.swap.Text = "Игроки = NPC: " .. (S.swap and "ВКЛ" or "ВЫКЛ")
 B.listPlayers.Text = "Игроки в списке: " .. (S.listPlayers and "ДА" or "НЕТ")
 B.killUI.Text = "KILL UI: " .. (S.killUI ~= false and "ВКЛ" or "ВЫКЛ")
-mark(B.hitPl, S.hitPlayers)
-B.hitPl.Text = "Бить игроков: " .. (S.hitPlayers and "ДА" or "НЕТ")
 mark(B.basic, S.basicAnim)
 B.basic.Text = "Только базовая анимация: " .. (S.basicAnim and "ДА" or "НЕТ")
+mark(B.sfx, S.sfx)
+B.sfx.Text = "Звуки атаки: " .. (S.sfx and "ВКЛ" or "ВЫКЛ")
 mark(B.puppet, puppet ~= nil)
 B.puppet.Text = "Кукла (защита): " .. (puppet and "ВКЛ" or "ВЫКЛ")
 mark(B.puppet2, puppet ~= nil)
