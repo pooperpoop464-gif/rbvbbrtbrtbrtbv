@@ -144,6 +144,8 @@ hideNPC = false, swap = false, listPlayers = false, basicAnim = false,
 selfEntry = nil, allEntry = nil,
 sfx = true,
 ctlMul = 1,   -- множитель скорости управляемого NPC
+ctlNoclip = true,   -- копия NPC проходит сквозь стены/игроков/NPC
+hitPlayers = false, -- визуальные удары/KILL по обычным игрокам (видно только тебе)
 }
 local npcs = {}
 local npcCtl = nil          -- визуальное управление настоящим NPC (копия, оригинал скрыт только у тебя)
@@ -2367,6 +2369,8 @@ clone.Parent = G.getFx()
 local root = rootOf(clone)
 if not root then clone:Destroy() return nil end
 vhHide(orig, "fight")
+local se0 = skins[orig]
+if se0 then se0.dead = true end -- если на игроке модель-скин, прячем и её
 local f = {fake = clone, root = root, hits = 0, last = os.clock()}
 -- звуки самого NPC берём с оригинала (у клона Sound удалены)
 f.snd = {sounds = {}}
@@ -2380,6 +2384,8 @@ if not f then return end
 fights[orig] = nil
 pcall(function() f.fake:Destroy() end)
 vhShow(orig, "fight")
+local se1 = skins[orig]
+if se1 and not deadChars[orig] then se1.dead = false end
 end
 connect(RunService.Heartbeat, function()
 for orig, f in pairs(fights) do
@@ -2415,6 +2421,8 @@ local dummy = Instance.new("Folder")
 dummy.Name = "CineDeathDummy"
 dummy.Parent = G.getFx()
 deadChars[orig] = {fake = dummy}
+local se2 = skins[orig]
+if se2 then se2.dead = true end
 vhHide(orig, "dead")
 vhShow(orig, "fight")
 task.delay(KILL_RESPAWN, function()
@@ -2423,7 +2431,9 @@ end)
 pcall(deathFX)
 end
 local function landHit(orig)
-if not orig or deadChars[orig] or Players:GetPlayerFromCharacter(orig) then return end
+if not orig or deadChars[orig] then return end
+local hitPl = Players:GetPlayerFromCharacter(orig)
+if hitPl and (not S.hitPlayers or hitPl == lp) then return end
 local f = fights[orig] or G.startFight(orig)
 if not f then return end
 f.hits = f.hits + 1
@@ -2467,7 +2477,7 @@ end
 local function isCandidate(m, h)
 return m and m:IsA("Model") and m ~= lp.Character and not isSkinModel(m) and not deadChars[m]
 and not (npcCtl and npcCtl.orig == m)
-and not fights[m] and not Players:GetPlayerFromCharacter(m)
+and not fights[m] and (S.hitPlayers or not Players:GetPlayerFromCharacter(m))
 and (not h:IsA("Humanoid") or h.Health > 0)
 end
 local toggleKillUI = function() end
@@ -2799,6 +2809,17 @@ e.limbs = G.buildLimbs(model, root)
 e.procedural = true
 npcCtl = {orig = orig, model = model, hum = hum, root = root, e = e, realRoot = realRoot,
 wasAnchored = realRoot.Anchored, temp = temp, baseSpeed = hum.WalkSpeed}
+-- без коллизий: Humanoid сам возвращает CanCollide части тела, поэтому гасим его каждый физический шаг
+npcCtl.parts = {}
+for _, d in ipairs(model:GetDescendants()) do
+if d:IsA("BasePart") then npcCtl.parts[#npcCtl.parts + 1] = d end
+end
+npcCtl.stepConn = RunService.Stepped:Connect(function()
+local c = npcCtl
+if c and S.ctlNoclip then
+for _, part in ipairs(c.parts) do part.CanCollide = false end
+end
+end)
 -- твой настоящий персонаж остаётся стоять на месте (иначе WASD двигал бы и его)
 pcall(function()
 realRoot.AssemblyLinearVelocity = Vector3.zero
@@ -2819,6 +2840,7 @@ function G.stopNpcCtl()
 if not npcCtl then return end
 local c = npcCtl
 npcCtl = nil
+if c.stepConn then c.stepConn:Disconnect() end
 pcall(function() c.model:Destroy() end)
 pcall(vhShow, c.orig, "ctl")
 local rr = c.realRoot
@@ -3173,7 +3195,7 @@ end
 local B = {}
 do
 local p = pages["NPC"]
-local g = grid(p, 282)
+local g = grid(p, 314)
 B.spec    = gbtn(g, "Наблюдать (3-е лицо)", function() enterSpec("third") end)
 B.first   = gbtn(g, "Вид от 1-го лица", function() enterSpec("first") end)
 B.lock    = gbtn(g, "Camera Lock", toggleLock)
@@ -3194,7 +3216,21 @@ gbtn(g, "Атака (Z)", function() G.swing() end)
 gbtn(g, "Стоп управление", function() G.stopNpcCtl() end)
 gbtn(g, "Скорость NPC -", function() S.ctlMul = math.clamp(S.ctlMul / 1.25, 0.25, 5) status(string.format("Скорость NPC: x%.2f (Shift = бег)", S.ctlMul)) end)
 gbtn(g, "Скорость NPC +", function() S.ctlMul = math.clamp(S.ctlMul * 1.25, 0.25, 5) status(string.format("Скорость NPC: x%.2f (Shift = бег)", S.ctlMul)) end)
-local list = scroller(p, 290)
+B.noclip = gbtn(g, "", function()
+S.ctlNoclip = not S.ctlNoclip
+if not S.ctlNoclip and npcCtl and npcCtl.root then pcall(function() npcCtl.root.CanCollide = true end) end
+status("Без коллизий: " .. (S.ctlNoclip and "ВКЛ" or "ВЫКЛ"))
+refreshButtons()
+end)
+B.hitPlayers = gbtn(g, "", function()
+S.hitPlayers = not S.hitPlayers
+S.listPlayers = S.hitPlayers
+scanNPCs()
+rebuildNPCList()
+status(S.hitPlayers and "Удары по игрокам ВКЛ (эффект виден только тебе)" or "Удары по игрокам ВЫКЛ")
+refreshButtons()
+end)
+local list = scroller(p, 322)
 local rows = {}
 rebuildNPCList = function()
 local alive = {}
@@ -3447,6 +3483,10 @@ mark(B.first, S.mode == "spec" and S.view == "first")
 mark(B.lock, S.lock)
 mark(B.control, npcCtl ~= nil)
 B.control.Text = "Управлять NPC: " .. (npcCtl and "ВКЛ" or "ВЫКЛ")
+mark(B.noclip, S.ctlNoclip)
+B.noclip.Text = "Без коллизий: " .. (S.ctlNoclip and "ВКЛ" or "ВЫКЛ")
+mark(B.hitPlayers, S.hitPlayers)
+B.hitPlayers.Text = "Бить игроков: " .. (S.hitPlayers and "ВКЛ" or "ВЫКЛ")
 mark(B.free, S.mode == "free")
 mark(B.selfView, S.mode == "self")
 mark(B.hide, S.hidden)
