@@ -10,7 +10,7 @@ pcall(function() if gethui then table.insert(roots, gethui()) end end)
 pcall(function() table.insert(roots, game:GetService("CoreGui")) end)
 pcall(function() table.insert(roots, game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")) end)
 for _, r in ipairs(roots) do
-for _, nm in ipairs({"CinePanel", "CineKill", "CineBlood"}) do
+for _, nm in ipairs({"CinePanel", "CineKill", "CineBlood", "CineSprint"}) do
 pcall(function()
 for _ = 1, 10 do
 local o = r:FindFirstChild(nm)
@@ -143,6 +143,7 @@ god = false,
 hideNPC = false, swap = false, listPlayers = false, basicAnim = false,
 selfEntry = nil, allEntry = nil,
 sfx = true,
+ctlMul = 1,   -- множитель скорости управляемого NPC
 }
 local npcs = {}
 local npcCtl = nil          -- визуальное управление настоящим NPC (копия, оригинал скрыт только у тебя)
@@ -2797,7 +2798,7 @@ e.arms = G.buildArms(model, root)
 e.limbs = G.buildLimbs(model, root)
 e.procedural = true
 npcCtl = {orig = orig, model = model, hum = hum, root = root, e = e, realRoot = realRoot,
-wasAnchored = realRoot.Anchored, temp = temp}
+wasAnchored = realRoot.Anchored, temp = temp, baseSpeed = hum.WalkSpeed}
 -- твой настоящий персонаж остаётся стоять на месте (иначе WASD двигал бы и его)
 pcall(function()
 realRoot.AssemblyLinearVelocity = Vector3.zero
@@ -2808,8 +2809,9 @@ if S.mode == "none" then
 cam.CameraType = Enum.CameraType.Custom
 cam.CameraSubject = hum
 end
+G.enterSelf() -- орбитальная камера: ПКМ поворачивает, колесо — дистанция
 if temp then G.observeAnims(orig, entry, 25) end
-status("Управляешь копией «" .. orig.Name .. "»: WASD/Space, Z — атака, X — KILL, ` — орбитальная камера, F5 — стоп"
+status("Управляешь копией «" .. orig.Name .. "»: WASD/Space, Shift — ускорение, ПКМ — поворот, Z — атака, X — KILL, F5 — стоп"
 .. (temp and ". Записываю его анимации 25 с" or ""))
 refreshButtons()
 end
@@ -2821,6 +2823,7 @@ pcall(function() c.model:Destroy() end)
 pcall(vhShow, c.orig, "ctl")
 local rr = c.realRoot
 if rr and rr.Parent then pcall(function() rr.Anchored = c.wasAnchored end) end
+if S.mode == "self" then exitAll() end
 if S.mode == "none" then
 local cam = getCam()
 cam.CameraType = Enum.CameraType.Custom
@@ -2961,7 +2964,7 @@ cam.CameraType = Enum.CameraType.Scriptable
 if S.mode == "free" then updateFree(dt)
 elseif S.mode == "spec" then updateSpec(dt)
 else G.updateSelf(dt) end
-cam.FieldOfView = S.fov
+cam.FieldOfView = S.fov + (S.fovKick or 0)
 end)
 local gui -- объявлено заранее для TogglePanel
 local ACTIONS = {
@@ -3170,7 +3173,7 @@ end
 local B = {}
 do
 local p = pages["NPC"]
-local g = grid(p, 250)
+local g = grid(p, 282)
 B.spec    = gbtn(g, "Наблюдать (3-е лицо)", function() enterSpec("third") end)
 B.first   = gbtn(g, "Вид от 1-го лица", function() enterSpec("first") end)
 B.lock    = gbtn(g, "Camera Lock", toggleLock)
@@ -3189,7 +3192,9 @@ gbtn(g, "KILL ближайшего", function() pressKillFX() G.killNearest() en
 gbtn(g, "KILL выбранного", function() pressKillFX() G.killSelected() end)
 gbtn(g, "Атака (Z)", function() G.swing() end)
 gbtn(g, "Стоп управление", function() G.stopNpcCtl() end)
-local list = scroller(p, 258)
+gbtn(g, "Скорость NPC -", function() S.ctlMul = math.clamp(S.ctlMul / 1.25, 0.25, 5) status(string.format("Скорость NPC: x%.2f (Shift = бег)", S.ctlMul)) end)
+gbtn(g, "Скорость NPC +", function() S.ctlMul = math.clamp(S.ctlMul * 1.25, 0.25, 5) status(string.format("Скорость NPC: x%.2f (Shift = бег)", S.ctlMul)) end)
+local list = scroller(p, 290)
 local rows = {}
 rebuildNPCList = function()
 local alive = {}
@@ -3384,6 +3389,23 @@ RunService:BindToRenderStep("CineJoy", Enum.RenderPriority.Input.Value + 1, func
 local ctl = npcCtl or puppet
 if (S.mode ~= "none" and S.mode ~= "self") or not ctl or typing() then return end
 local hum = ctl.hum
+-- ускорение: Shift = бег (x2.2), Ctrl = медленно (x0.4), базовый множитель меняется кнопками «Скорость NPC»
+if npcCtl then
+local mul = S.ctlMul
+if UIS:IsKeyDown(K.LeftShift) then mul = mul * 2.2 elseif UIS:IsKeyDown(K.LeftControl) then mul = mul * 0.4 end
+pcall(function() hum.WalkSpeed = npcCtl.baseSpeed * mul end)
+end
+-- поворот: ПКМ зажат -> NPC плавно смотрит туда же, куда камера (можно идти боком); отпущен -> NPC поворачивается по ходу движения
+local rr = ctl.root
+if S.rmb and S.mode == "self" and rr and rr.Parent then
+pcall(function()
+hum.AutoRotate = false
+local want = CFrame.new(rr.Position) * CFrame.fromOrientation(0, S.syaw, 0)
+rr.CFrame = rr.CFrame:Lerp(want, 0.3)
+end)
+else
+pcall(function() hum.AutoRotate = true end)
+end
 local vec = Vector3.zero
 if UIS:IsKeyDown(K.W) then vec = vec + Vector3.new(0, 0, -1) end
 if UIS:IsKeyDown(K.S) then vec = vec + Vector3.new(0, 0, 1) end
@@ -3412,6 +3434,8 @@ table.insert(lines, "ПКМ (зажать) - поворот камеры")
 table.insert(lines, "WASD, Q/E    - полёт (Freecam)")
 table.insert(lines, "Shift/Ctrl  - быстрее / медленнее")
 table.insert(lines, "Колесо      - скорость / дистанция")
+table.insert(lines, "NPC-копия: Shift - бег, Ctrl - медленно")
+table.insert(lines, "NPC-копия: ПКМ - поворот камеры, зажат - NPC смотрит по камере")
 new("TextLabel", {Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = PANEL, BorderSizePixel = 0,
 Text = table.concat(lines, "\n"), TextColor3 = TXT, Font = Enum.Font.Code, TextSize = 12,
 TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, pages["Клавиши"])
@@ -3480,6 +3504,73 @@ if d.Parent and d[info.prop] ~= info.hid then d[info.prop] = info.hid end
 end
 end
 end)
+-- ===================== КРАСНЫЙ ЭФФЕКТ БЕГА (Shift при управлении NPC) =====================
+-- всё внутри одной функции, чтобы не упереться в лимит локальных переменных Luau
+function G.initSprintFX()
+local RED = Color3.fromRGB(255, 25, 35)
+local sg = new("ScreenGui", {Name = "CineSprint", ResetOnSpawn = false, DisplayOrder = 997,
+IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
+local ok = false
+if gethui then ok = pcall(function() sg.Parent = gethui() end) and sg.Parent ~= nil end
+if not ok then ok = pcall(function() sg.Parent = game:GetService("CoreGui") end) and sg.Parent ~= nil end
+if not ok then sg.Parent = lp:WaitForChild("PlayerGui") end
+G.sprintGui = sg
+local root = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false}, sg)
+-- красные полосы по краям экрана (мягкий градиент к центру)
+local function edge(ax, rot)
+local f = new("Frame", {Size = UDim2.fromScale(0.24, 1), Position = UDim2.fromScale(ax, 0),
+AnchorPoint = Vector2.new(ax, 0), BackgroundColor3 = RED, BorderSizePixel = 0}, root)
+new("UIGradient", {Rotation = rot, Transparency = NumberSequence.new({
+NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1)})}, f)
+return f
+end
+local edgeL, edgeR = edge(0, 0), edge(1, 180)
+-- тонкие красные полосы сверху и снизу
+local function bar(ay)
+return new("Frame", {Size = UDim2.new(1, 0, 0, 5), Position = UDim2.fromScale(0, ay),
+AnchorPoint = Vector2.new(0, ay), BackgroundColor3 = RED, BorderSizePixel = 0}, root)
+end
+local barT, barB = bar(0), bar(1)
+-- красные линии скорости, разлетающиеся от центра к краям
+local streaks = {}
+for i = 1, 18 do
+local f = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(100, 2),
+BackgroundColor3 = RED, BorderSizePixel = 0, BackgroundTransparency = 1}, root)
+streaks[i] = {f = f, t = math.random(), side = (i % 2 == 0) and 1 or -1, y = 0.05 + math.random() * 0.9,
+len = math.random(90, 240), spd = 1.4 + math.random() * 1.4}
+end
+local k = 0
+connect(RunService.RenderStepped, function(dt)
+local c = npcCtl
+local want = 0
+if c and c.hum.Parent and not typing() and UIS:IsKeyDown(K.LeftShift) and c.hum.MoveDirection.Magnitude > 0.1 then
+want = 1
+end
+k = k + (want - k) * math.min(dt * (want > k and 6 or 4), 1)
+S.fovKick = 12 * k   -- небольшой «рывок» FOV при беге
+if k < 0.02 then
+root.Visible = false
+return
+end
+root.Visible = true
+local pulse = k * (0.85 + 0.15 * math.sin(os.clock() * 14))
+edgeL.BackgroundTransparency = 1 - pulse
+edgeR.BackgroundTransparency = 1 - pulse
+barT.BackgroundTransparency = 1 - 0.9 * pulse
+barB.BackgroundTransparency = 1 - 0.9 * pulse
+for _, st in ipairs(streaks) do
+st.t = st.t + dt * st.spd
+if st.t >= 1 then
+st.t = 0
+st.y = 0.05 + math.random() * 0.9
+st.len = math.random(90, 240)
+end
+st.f.Position = UDim2.fromScale(0.5 + st.side * (0.28 + 0.22 * st.t), st.y)
+st.f.Size = UDim2.fromOffset(st.len * (0.4 + st.t), 2)
+st.f.BackgroundTransparency = 1 - 0.85 * pulse * (1 - st.t)
+end
+end)
+end
 genv.__CinePanelCleanup = function()
 exitAll()
 unbindSink()
@@ -3507,6 +3598,8 @@ pcall(function() RunService:UnbindFromRenderStep("CineJoy") end)
 for _, c in ipairs(conns) do c:Disconnect() end
 if gui then gui:Destroy() end
 if killGui then killGui:Destroy() end
+if G.sprintGui then G.sprintGui:Destroy() end
+S.fovKick = 0
 genv.__CinePanelCleanup = nil
 end
 -- каждый шаг запуска в своём pcall: сбой одного шага (например, файл камер) больше не ломает весь запуск
@@ -3525,6 +3618,7 @@ G.step("список NPC", rebuildNPCList)
 G.step("список камер", rebuildCamList)
 G.step("вкладка", function() showTab("NPC") end)
 G.step("кнопки", refreshButtons)
+G.step("эффект бега", G.initSprintFX)
 status("Готово. RightShift — скрыть/показать панель" .. (G.initErr and ("\nОшибки шагов: " .. G.initErr .. "см. консоль F9") or ""))
 end, function(e) return debug.traceback(tostring(e), 2) end)
 if not __cineOk then
