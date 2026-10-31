@@ -77,6 +77,8 @@ KillFront   = K.X,
 KillNearest = K.N,
 KillSelected = K.PageDown,
 Attack      = K.Z,
+TeleportSel = K.T,
+TeleportNext = K.G,
 Puppet      = K.P,
 SelfView    = K.Backquote,
 ReviveAll   = K.PageUp,
@@ -105,6 +107,8 @@ local KEY_LABELS = {
 {"KillNearest", "KILL: убить ближайшего NPC"},
 {"KillSelected", "KILL: убить выбранного NPC"},
 {"Attack", "Атака (замах + удар перед собой)"},
+{"TeleportSel", "Телепорт к выбранному NPC"},
+{"TeleportNext", "Телепорт к следующему NPC (по кругу)"},
 {"Puppet", "Кукла (неуязвимость от NPC)"},
 {"SelfView", "3-е лицо за себя / куклу"},
 {"ReviveAll", "Вернуть всех"},
@@ -2962,6 +2966,53 @@ status("Управление NPC выключено")
 refreshButtons()
 reconcileAsync()
 end
+-- ===================== ТЕЛЕПОРТ К NPC (только на твоём клиенте) =====================
+-- управляешь копией NPC или куклой -> телепортируется она; иначе камера перелетает к NPC (Freecam)
+function G.tpTo(m)
+if not (m and m.Parent) then status("NPC не найден") return end
+local r = rootOf(m)
+if not r then status("У NPC нет частей тела") return end
+if npcCtl and npcCtl.orig == m then status("Ты уже управляешь этим NPC") return end
+local pos = r.Position + r.CFrame.LookVector * 4
+local look = Vector3.new(r.Position.X, pos.Y, r.Position.Z)
+local who = npcCtl or puppet
+if who and who.model and who.model.Parent then
+pcall(function()
+who.model:PivotTo(CFrame.lookAt(pos, look))
+who.root.AssemblyLinearVelocity = Vector3.zero
+end)
+S.target = m
+updateNPCHide()
+rebuildNPCList()
+refreshButtons()
+status("Телепорт к «" .. m.Name .. "»")
+return
+end
+if S.mode == "spec" then
+if S.target ~= m then setTarget(m) end
+status("Наблюдение: " .. m.Name)
+return
+end
+if S.mode ~= "free" then enterFree() end
+S.lock = false
+local focus = r.Position + Vector3.new(0, 1.5, 0)
+local camPos = r.Position + r.CFrame.LookVector * 9 + Vector3.new(0, 3.5, 0)
+local cf = CFrame.lookAt(camPos, focus)
+if S.smooth then
+S.tween = {from = getCam().CFrame, to = cf, t = 0, dur = 0.6, fov0 = S.fov, fov1 = S.fov}
+else
+setFree(cf)
+end
+S.target = m
+updateNPCHide()
+rebuildNPCList()
+refreshButtons()
+status("Камера у «" .. m.Name .. "»")
+end
+function G.tpNext()
+cycle(1)
+if S.target then G.tpTo(S.target) end
+end
 function G.toggleNpcCtl()
 if npcCtl then G.stopNpcCtl() else G.startNpcCtl() end
 refreshButtons()
@@ -3131,6 +3182,8 @@ KillFront = function() pressKillFX() killFront() end,
 KillNearest = function() pressKillFX() G.killNearest() end,
 KillSelected = function() pressKillFX() G.killSelected() end,
 Attack = function() G.swing() end,
+TeleportSel = function() if S.target then G.tpTo(S.target) else status("Сначала выбери NPC") end end,
+TeleportNext = function() G.tpNext() end,
 Puppet = function() togglePuppet() end,
 SelfView = function() if S.mode == "self" then exitAll() else G.enterSelf() end end,
 ReviveAll = reviveAll,
@@ -3215,7 +3268,7 @@ if gethui then ok = pcall(function() gui.Parent = gethui() end) and gui.Parent ~
 if not ok then ok = pcall(function() gui.Parent = game:GetService("CoreGui") end) and gui.Parent ~= nil end
 if not ok then gui.Parent = lp:WaitForChild("PlayerGui") end
 end
-local main = new("Frame", {Size = UDim2.fromOffset(320, 580), Position = UDim2.fromOffset(20, 80),
+local main = new("Frame", {Size = UDim2.fromOffset(320, 640), Position = UDim2.fromOffset(20, 80),
 BackgroundColor3 = BG, BorderSizePixel = 0, Active = true}, gui)
 new("UICorner", {CornerRadius = UDim.new(0, 8)}, main)
 local titleBar = new("TextLabel", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Color3.fromRGB(16, 16, 22),
@@ -3301,7 +3354,7 @@ end
 local B = {}
 do
 local p = pages["NPC"]
-local g = grid(p, 314)
+local g = grid(p, 346)
 B.spec    = gbtn(g, "Наблюдать (3-е лицо)", function() enterSpec("third") end)
 B.first   = gbtn(g, "Вид от 1-го лица", function() enterSpec("first") end)
 B.lock    = gbtn(g, "Camera Lock", toggleLock)
@@ -3336,24 +3389,31 @@ rebuildNPCList()
 status(S.hitPlayers and "Удары по игрокам ВКЛ (эффект виден только тебе)" or "Удары по игрокам ВЫКЛ")
 refreshButtons()
 end)
-local list = scroller(p, 322)
+gbtn(g, "ТП к выбранному (T)", function() if S.target then G.tpTo(S.target) else status("Сначала выбери NPC") end end)
+gbtn(g, "ТП к след. NPC (G)", function() G.tpNext() end)
+local list = scroller(p, 354)
 local rows = {}
 rebuildNPCList = function()
 local alive = {}
 for _, e in ipairs(npcs) do
-alive[e.model] = true
-local row = rows[e.model]
+local mdl = e.model
+alive[mdl] = true
+local row = rows[mdl]
 if not row then
-row = btn(list, "", function() setTarget(e.model) end,
-{Size = UDim2.new(1, 0, 0, 24), TextXAlignment = Enum.TextXAlignment.Left})
-rows[e.model] = row
+local fr = new("Frame", {Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1}, list)
+local b1 = btn(fr, "", function() setTarget(mdl) end,
+{Size = UDim2.new(1, -52, 1, 0), TextXAlignment = Enum.TextXAlignment.Left})
+btn(fr, "TP", function() G.tpTo(mdl) end,
+{Size = UDim2.fromOffset(48, 24), Position = UDim2.new(1, -48, 0, 0), BackgroundColor3 = Color3.fromRGB(70, 90, 150)})
+row = {frame = fr, btn = b1}
+rows[mdl] = row
 end
-row.LayoutOrder = e.order
-row.Text = "  " .. e.model.Name .. "  [" .. math.floor(e.dist) .. " м]"
-row.BackgroundColor3 = (e.model == S.target) and Color3.fromRGB(80, 105, 220) or BTN
+row.frame.LayoutOrder = e.order
+row.btn.Text = "  " .. mdl.Name .. "  [" .. math.floor(e.dist) .. " м]"
+row.btn.BackgroundColor3 = (mdl == S.target) and Color3.fromRGB(80, 105, 220) or BTN
 end
 for m, row in pairs(rows) do
-if not alive[m] then row:Destroy() rows[m] = nil end
+if not alive[m] then row.frame:Destroy() rows[m] = nil end
 end
 end
 end
