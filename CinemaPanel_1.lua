@@ -144,6 +144,7 @@ hideNPC = false, swap = false, listPlayers = false, basicAnim = false,
 selfEntry = nil, allEntry = nil,
 sfx = true,
 ctlMul = 1,   -- множитель скорости управляемого NPC
+ctlTrail = true,    -- красный хвост от спины управляемого NPC
 ctlNoclip = true,   -- копия NPC проходит сквозь стены/игроков/NPC
 hitPlayers = false, -- визуальные удары/KILL по обычным игрокам (видно только тебе)
 }
@@ -1030,40 +1031,109 @@ for _, d in ipairs(model:GetDescendants()) do
 if d:IsA("Sound") then G.addSound(entry, d) end
 end
 end
-G.SFX_FB = {attack = {"attack"}, hit = {"hit"}, death = {"death", "hit"}}
-G.DEFAULT_ATTACK = "rbxasset://sounds/swordslash.wav" -- запасной звук, если у модели нет своих
+-- запасные встроенные звуки клиента; перебираются по очереди, пока не найдётся тот, что реально загрузился
+G.SFX_DEF = {
+attack = {"rbxasset://sounds/swordslash.wav", "rbxasset://sounds/swordlunge.wav", "rbxasset://sounds/unsheath.wav"},
+hit = {"rbxasset://sounds/impact_explosion_03.mp3", "rbxasset://sounds/kerplunk.wav",
+"rbxasset://sounds/swordlunge.wav", "rbxasset://sounds/swordslash.wav"},
+death = {"rbxasset://sounds/uuhhh.mp3", "rbxasset://sounds/impact_explosion_03.mp3",
+"rbxasset://sounds/bass.mp3", "rbxasset://sounds/kerplunk.wav"},
+}
+G.SFX_FB = {attack = {"attack", "other"}, hit = {"hit", "attack", "other"}, death = {"death", "hit", "attack", "other"}}
+G.customSfx = {}   -- свои ID звуков (поля на вкладке «Мир»): attack / hit / death
+-- звук играет глобально (SoundService), без привязки к месту, чтобы его всегда было слышно
+function G.sfxOne(id, vol, spd)
+local snd = Instance.new("Sound")
+snd.SoundId = id
+snd.Volume = math.clamp(vol or 1, 0.6, 10)
+snd.PlaybackSpeed = (spd and spd > 0) and spd or 1
+snd.Looped = false
+snd.Parent = game:GetService("SoundService")
+snd:Play()
+game:GetService("Debris"):AddItem(snd, 15)
+return snd
+end
+function G.sfxOK(snd)   -- дождаться загрузки и проверить, что звук не пустой
+pcall(function() game:GetService("ContentProvider"):PreloadAsync({snd}) end)
+return snd.IsLoaded or snd.TimeLength > 0
+end
+function G.playDefault(cat, vol, idx)
+local list = G.SFX_DEF[cat] or G.SFX_DEF.attack
+idx = idx or 1
+local id = list[idx]
+if not id then return end
+local ok, snd = pcall(G.sfxOne, id, vol, 1)
+if not ok or not snd then
+G.playDefault(cat, vol, idx + 1)
+return
+end
+task.spawn(function()
+if not G.sfxOK(snd) then
+pcall(function() snd:Destroy() end)
+G.playDefault(cat, vol, idx + 1)
+end
+end)
+end
+function G.prewarmSfx()
+for _, list in pairs(G.SFX_DEF) do
+for _, id in ipairs(list) do
+task.spawn(function()
+local sn = Instance.new("Sound")
+sn.SoundId = id
+pcall(function() game:GetService("ContentProvider"):PreloadAsync({sn}) end)
+sn:Destroy()
+end)
+end
+end
+end
+-- возвращает "custom" / "own" / "default" или false. useDefault == true разрешает встроенные звуки
 function G.playSfxAt(entry, cat, pos, vol, useDefault)
 if not S.sfx then return false end
+vol = vol or 1
+local function withFallback(id, v, spd)
+local ok, snd = pcall(G.sfxOne, id, v, spd)
+if not ok or not snd then
+if useDefault == true then G.playDefault(cat, vol, 1) end
+return
+end
+task.spawn(function()
+if not G.sfxOK(snd) and useDefault == true then G.playDefault(cat, vol, 1) end
+end)
+end
+local cid = G.customSfx and G.customSfx[cat]
+if cid then
+withFallback(cid, vol, 1)
+return "custom"
+end
 local x
 if entry and entry.sounds then
 for _, c in ipairs(G.SFX_FB[cat] or {cat}) do
 local list = {}
-for _, s in ipairs(entry.sounds) do
-if s.cat == c then list[#list + 1] = s end
+for _, sd in ipairs(entry.sounds) do
+if sd.cat == c and not sd.loop then list[#list + 1] = sd end
 end
 if #list > 0 then x = list[math.random(#list)] break end
 end
 end
-if not x and useDefault then x = {id = G.DEFAULT_ATTACK, vol = 0.8, spd = 1} end
-if not x then return false end
-local ok = pcall(function()
-local part = Instance.new("Part")
-part.Anchored, part.CanCollide, part.CanTouch, part.CanQuery = true, false, false, false
-part.Transparency = 1
-part.Size = Vector3.new(0.2, 0.2, 0.2)
-part.Position = pos
-part.Parent = G.getFx()
-local snd = Instance.new("Sound")
-snd.SoundId = x.id
-snd.Volume = math.clamp((x.vol or 1) * (vol or 1), 0, 10)
-snd.PlaybackSpeed = (x.spd and x.spd > 0) and x.spd or 1
-snd.Looped = false
-snd.RollOffMaxDistance = 150
-snd.Parent = part
-snd:Play()
-game:GetService("Debris"):AddItem(part, 10)
+if x then
+withFallback(x.id, (x.vol or 1) * vol, x.spd)
+return "own"
+end
+if useDefault == true then
+G.playDefault(cat, vol, 1)
+return "default"
+end
+return false
+end
+function G.testSfx()
+status("Тест звуков: атака -> удар -> смерть")
+task.spawn(function()
+local e = G.actor and G.actor()
+for _, c in ipairs({"attack", "hit", "death"}) do
+G.playSfxAt(e and e.entry or nil, c, nil, 1, true)
+task.wait(1.3)
+end
 end)
-return ok
 end
 function G.isAttacking(model)
 for _, t in ipairs(G.livePlayingIds(model)) do
@@ -1786,6 +1856,13 @@ if a[1].Parent and a[2] then a[1].Transform = a[2] end
 end
 end
 if ne.fakeAtk then G.applyFakeAttack(ne) end
+local ttr = nc.trail
+if ttr then
+local moving = nc.hum.MoveDirection.Magnitude > 0.1
+local spr = moving and UIS:IsKeyDown(K.LeftShift) and not typing()
+ttr.Enabled = S.ctlTrail and moving
+ttr.Lifetime = spr and 0.9 or 0.45
+end
 end
 end
 end)
@@ -2410,9 +2487,9 @@ fights[orig] = nil
 local clone = f.fake
 pcall(function()
 local p = f.root.Position
-if not G.playSfxAt(f.snd, "death", p, 1) then
-local ae = (puppet and puppet.e) or (lp.Character and skins[lp.Character])
-G.playSfxAt(ae and ae.entry or nil, "death", p, 1)
+if not G.playSfxAt(f.snd, "death", p, 1, false) then
+local ae = G.actor()
+G.playSfxAt(ae and ae.entry or nil, "death", p, 1.2, true)
 end
 end)
 pcall(G.disintegrate, clone)
@@ -2440,9 +2517,10 @@ f.hits = f.hits + 1
 f.last = os.clock()
 local pos = f.root.Position + Vector3.new(0, 1, 0)
 pcall(function()
-local ae = (puppet and puppet.e) or (lp.Character and skins[lp.Character])
-G.playSfxAt(f.snd, "hit", pos, 1)
-G.playSfxAt(ae and ae.entry or nil, "hit", pos, 0.9)
+local ae = G.actor()
+if not G.playSfxAt(f.snd, "hit", pos, 1, false) then
+G.playSfxAt(ae and ae.entry or nil, "hit", pos, 1, true)
+end
 end)
 for _ = 1, 10 do -- искры от удара
 G.spawnBit(pos, Color3.fromRGB(255, 235, 170), Vector3.new(math.random(-14, 14), math.random(4, 14), math.random(-14, 14)),
@@ -2819,6 +2897,34 @@ local c = npcCtl
 if c and S.ctlNoclip then
 for _, part in ipairs(c.parts) do part.CanCollide = false end
 end
+end)
+-- красная полоса (Trail) от спины NPC: две точки на спине, шлейф тянется назад при движении
+pcall(function()
+local size = model:GetExtentsSize()
+local h = math.clamp(size.Y * 0.35, 0.8, 6)
+local back = root.Size.Z / 2 + 0.1
+local a0 = Instance.new("Attachment")
+a0.Name = "CineTrailA0"
+a0.Position = Vector3.new(0, h, back)
+a0.Parent = root
+local a1 = Instance.new("Attachment")
+a1.Name = "CineTrailA1"
+a1.Position = Vector3.new(0, -h * 0.6, back)
+a1.Parent = root
+local tr = Instance.new("Trail")
+tr.Name = "CineBackTrail"
+tr.Attachment0, tr.Attachment1 = a0, a1
+tr.Color = ColorSequence.new(Color3.fromRGB(255, 35, 45), Color3.fromRGB(120, 0, 10))
+tr.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 1)})
+tr.WidthScale = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0.15)})
+tr.LightEmission = 1
+tr.LightInfluence = 0
+tr.Lifetime = 0.45
+tr.MinLength = 0.05
+tr.FaceCamera = true
+tr.Enabled = false
+tr.Parent = root
+npcCtl.trail = tr
 end)
 -- твой настоящий персонаж остаётся стоять на месте (иначе WASD двигал бы и его)
 pcall(function()
@@ -3284,7 +3390,7 @@ end
 end
 do
 local p = pages["Мир"]
-local g = grid(p, 218)
+local g = grid(p, 250)
 B.night = gbtn(g, "День <-> Ночь", toggleDayNight)
 gbtn(g, "Сбросить время", G.resetTime)
 B.hide = gbtn(g, "Скрыть игроков", function() toggleHide() end)
@@ -3303,9 +3409,25 @@ B.puppet = gbtn(g, "", function() togglePuppet() end)
 B.basic = gbtn(g, "", function() S.basicAnim = not S.basicAnim refreshButtons() end)
 B.sfx = gbtn(g, "", function() S.sfx = not S.sfx refreshButtons() end)
 gbtn(g, "Копировать звуки NPC", G.copySounds)
-B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 226),
+B.trail = gbtn(g, "", function() S.ctlTrail = not S.ctlTrail refreshButtons() end)
+gbtn(g, "Тест звуков", function() G.testSfx() end)
+B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 258),
 BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
 TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
+local function sbox(cat, ph, i)
+local b = new("TextBox", {Size = UDim2.new(1 / 3, -4, 0, 24), Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 304),
+PlaceholderText = ph, Text = "", ClearTextOnFocus = false, BackgroundColor3 = PANEL, TextColor3 = TXT,
+PlaceholderColor3 = Color3.fromRGB(140, 140, 150), Font = Enum.Font.Gotham, TextSize = 11, BorderSizePixel = 0}, p)
+new("UICorner", {CornerRadius = UDim.new(0, 5)}, b)
+b.FocusLost:Connect(function()
+local id = tonumber((b.Text or ""):match("%d+"))
+G.customSfx[cat] = id and ("rbxassetid://" .. id) or nil
+status(id and ("Свой звук (" .. cat .. "): " .. id) or ("Свой звук (" .. cat .. ") сброшен"))
+end)
+end
+sbox("attack", "ID атаки", 1)
+sbox("hit", "ID удара", 2)
+sbox("death", "ID смерти", 3)
 end
 do
 local p = pages["Модели"]
@@ -3503,6 +3625,8 @@ mark(B.basic, S.basicAnim)
 B.basic.Text = "Только базовая анимация: " .. (S.basicAnim and "ДА" or "НЕТ")
 mark(B.sfx, S.sfx)
 B.sfx.Text = "Звуки атаки: " .. (S.sfx and "ВКЛ" or "ВЫКЛ")
+mark(B.trail, S.ctlTrail)
+B.trail.Text = "Хвост от спины: " .. (S.ctlTrail and "ВКЛ" or "ВЫКЛ")
 mark(B.puppet, puppet ~= nil)
 B.puppet.Text = "Кукла (защита): " .. (puppet and "ВКЛ" or "ВЫКЛ")
 mark(B.puppet2, puppet ~= nil)
@@ -3659,6 +3783,7 @@ G.step("список камер", rebuildCamList)
 G.step("вкладка", function() showTab("NPC") end)
 G.step("кнопки", refreshButtons)
 G.step("эффект бега", G.initSprintFX)
+G.step("звуки", G.prewarmSfx)
 status("Готово. RightShift — скрыть/показать панель" .. (G.initErr and ("\nОшибки шагов: " .. G.initErr .. "см. консоль F9") or ""))
 end, function(e) return debug.traceback(tostring(e), 2) end)
 if not __cineOk then
