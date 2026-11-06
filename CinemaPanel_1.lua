@@ -83,6 +83,7 @@ Puppet      = K.P,
 SelfView    = K.Backquote,
 ReviveAll   = K.PageUp,
 Exit        = K.Backspace,
+CleanScreen = K.RightControl,
 }
 local KEY_LABELS = {
 {"TogglePanel", "Показать/скрыть панель"},
@@ -113,6 +114,7 @@ local KEY_LABELS = {
 {"SelfView", "3-е лицо за себя / куклу"},
 {"ReviveAll", "Вернуть всех"},
 {"Exit", "Выйти из всех режимов"},
+{"CleanScreen", "Чистый экран (скрыть весь UI)"},
 }
 local genv = (getgenv and getgenv()) or _G
 if genv.__CinePanelCleanup then pcall(genv.__CinePanelCleanup) end
@@ -151,6 +153,8 @@ ctlMul = 1,   -- множитель скорости управляемого NP
 ctlTrail = true,    -- красный хвост от спины управляемого NPC
 ctlNoclip = true,   -- копия NPC проходит сквозь стены/игроков/NPC
 hitPlayers = false, -- визуальные удары/KILL по обычным игрокам (видно только тебе)
+clean = false,      -- «чистый экран»: весь интерфейс скрыт (для записи видео)
+cleanTags = true,   -- в чистом экране прятать и ники / полоски HP / метки над головами
 }
 local npcs = {}
 local npcCtl = nil          -- визуальное управление настоящим NPC (копия, оригинал скрыт только у тебя)
@@ -3189,6 +3193,7 @@ SelfView = function() if S.mode == "self" then exitAll() else G.enterSelf() end 
 ReviveAll = reviveAll,
 Exit = function() exitAll() G.stopNpcCtl() end,
 TogglePanel = function() if gui then gui.Enabled = not gui.Enabled end end,
+CleanScreen = function() if G.toggleClean then G.toggleClean() end end,
 }
 connect(UIS.InputBegan, function(input, gp)
 if typing() then return end
@@ -3450,7 +3455,9 @@ end
 end
 do
 local p = pages["Мир"]
-local g = grid(p, 250)
+local g = grid(p, 284)
+B.clean = gbtn(g, "", function() if G.toggleClean then G.toggleClean() end end)
+B.cleanTags = gbtn(g, "", function() if G.toggleCleanTags then G.toggleCleanTags() end end)
 B.night = gbtn(g, "День <-> Ночь", toggleDayNight)
 gbtn(g, "Сбросить время", G.resetTime)
 B.hide = gbtn(g, "Скрыть игроков", function() toggleHide() end)
@@ -3471,11 +3478,11 @@ B.sfx = gbtn(g, "", function() S.sfx = not S.sfx refreshButtons() end)
 gbtn(g, "Копировать звуки NPC", G.copySounds)
 B.trail = gbtn(g, "", function() S.ctlTrail = not S.ctlTrail refreshButtons() end)
 gbtn(g, "Тест звуков", function() G.testSfx() end)
-B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 258),
+B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 290),
 BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
 TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
 local function sbox(cat, ph, i)
-local b = new("TextBox", {Size = UDim2.new(1 / 3, -4, 0, 24), Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 304),
+local b = new("TextBox", {Size = UDim2.new(1 / 3, -4, 0, 24), Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 336),
 PlaceholderText = ph, Text = "", ClearTextOnFocus = false, BackgroundColor3 = PANEL, TextColor3 = TXT,
 PlaceholderColor3 = Color3.fromRGB(140, 140, 150), Font = Enum.Font.Gotham, TextSize = 11, BorderSizePixel = 0}, p)
 new("UICorner", {CornerRadius = UDim.new(0, 5)}, b)
@@ -3694,6 +3701,10 @@ B.puppet2.Text = "Кукла: " .. (puppet and "ВКЛ" or "ВЫКЛ")
 B.smooth.Text = "Плавно: " .. (S.smooth and "ВКЛ" or "ВЫКЛ")
 B.markers.Text = "Маркеры: " .. (S.markers and "ВКЛ" or "ВЫКЛ")
 B.hideSelf.Text = "Скрывать и себя: " .. (S.hideSelf and "ДА" or "НЕТ")
+mark(B.clean, S.clean)
+B.clean.Text = "Чистый экран (" .. KEYS.CleanScreen.Name .. ")"
+mark(B.cleanTags, S.cleanTags)
+B.cleanTags.Text = "+ ники над головами: " .. (S.cleanTags and "ДА" or "НЕТ")
 B.info.Text = string.format("FOV: %d   Скорость: %d\nВремя: %s", math.floor(S.fov + 0.5), math.floor(S.speed + 0.5),
 S.timeLock and (S.night and "ночь (фикс.)" or "день (фикс.)") or "по игре")
 end
@@ -3795,7 +3806,182 @@ st.f.BackgroundTransparency = 1 - 0.85 * pulse * (1 - st.t)
 end
 end)
 end
+-- ===================== ЧИСТЫЙ ЭКРАН (скрыть весь интерфейс для записи видео) =====================
+-- прячет: интерфейс игры (PlayerGui), интерфейс Roblox (CoreGui, топбар, чат, рюкзак, список игроков),
+-- UI других скриптов, ники/HP над головами (по желанию), курсор и саму панель.
+-- эффекты бега и крови (CineSprint / CineBlood) остаются — это часть кадра.
+-- всё внутри одной функции, чтобы не упереться в лимит локальных переменных Luau
+function G.initClean()
+local StarterGui = game:GetService("StarterGui")
+local GuiService = game:GetService("GuiService")
+local TextChatService
+pcall(function() TextChatService = game:GetService("TextChatService") end)
+local OWN = {CinePanel = true, CineKill = true, CineBlood = true, CineSprint = true}
+local hui
+pcall(function() if gethui then hui = gethui() end end)
+local saved = {}        -- [объект] = {свойство, исходное значение, скрытое значение}
+local cons = {}
+local coreOrig = {}
+local topbarOrig, mouseOrig, panelWas
+local acc = 0
+-- настоящее исходное значение, если объект уже скрыт другой функцией («Скрыть игроков» / «Скрыть NPC»)
+local function realOrig(o, prop, cur)
+local hd = hiddenData[o]
+if hd and hd.prop == prop then return hd.orig end
+for _, rec in pairs(VH) do
+local info = rec.orig[o]
+if info and info[1] == prop then return info[3] end
+end
+return cur
+end
+local function hide(o, prop, hid)
+if saved[o] then return end
+local ok, cur = pcall(function() return o[prop] end)
+if not ok then return end
+saved[o] = {prop, realOrig(o, prop, cur), hid}
+pcall(function() o[prop] = hid end)
+end
+local function isOwn(o)
+return OWN[o.Name] == true or o == hui
+end
+-- интерфейс в PlayerGui / CoreGui / gethui: все ScreenGui, BillboardGui, SurfaceGui
+local function hideGuiObj(o)
+if o:IsA("LayerCollector") and not isOwn(o) then hide(o, "Enabled", false) end
+end
+-- объекты в мире: BillboardGui (ники, HP, метки квестов) и стандартные имена Humanoid
+local function hideWorldObj(o)
+if not S.cleanTags then return end
+if o:IsA("BillboardGui") then
+hide(o, "Enabled", false)
+elseif o:IsA("Humanoid") then
+hide(o, "DisplayDistanceType", Enum.HumanoidDisplayDistanceType.None)
+end
+end
+local function watchContainer(c, fn, deep)
+if not c then return end
+pcall(function()
+for _, o in ipairs(deep and c:GetDescendants() or c:GetChildren()) do fn(o) end
+local sig = deep and c.DescendantAdded or c.ChildAdded
+table.insert(cons, sig:Connect(function(o)
+if not S.clean then return end
+if not (o:IsA("LayerCollector") or o:IsA("Humanoid")) then return end   -- остальное не трогаем (экономия)
+task.defer(function() if o.Parent then pcall(fn, o) end end)
+end))
+end)
+end
+local function applyCore()
+for _, t in ipairs(Enum.CoreGuiType:GetEnumItems()) do
+if t ~= Enum.CoreGuiType.All then
+pcall(function() StarterGui:SetCoreGuiEnabled(t, false) end)
+end
+end
+pcall(function() StarterGui:SetCore("TopbarEnabled", false) end)
+end
+local function cursor()
+-- курсор прячем, только пока панель скрыта (если открыть панель RightShift — курсор вернётся)
+pcall(function() UIS.MouseIconEnabled = gui and gui.Enabled or false end)
+end
+function G.cleanOn()
+if S.clean then return end
+S.clean = true
+saved, cons, coreOrig = {}, {}, {}
+-- 1) Roblox CoreGui (рюкзак, чат, список игроков, здоровье, эмоции) + топбар
+for _, t in ipairs(Enum.CoreGuiType:GetEnumItems()) do
+if t ~= Enum.CoreGuiType.All then
+local ok, v = pcall(function() return StarterGui:GetCoreGuiEnabled(t) end)
+if ok then coreOrig[t] = v end
+end
+end
+pcall(function() topbarOrig = StarterGui:GetCore("TopbarEnabled") end)
+applyCore()
+-- 2) новый чат (TextChatService): окно, строка ввода, пузыри над головами
+if TextChatService then
+for _, cls in ipairs({"ChatWindowConfiguration", "ChatInputBarConfiguration", "BubbleChatConfiguration"}) do
+pcall(function()
+local cfg = TextChatService:FindFirstChildOfClass(cls)
+if cfg then hide(cfg, "Enabled", false) end
+end)
+end
+end
+-- 3) интерфейс игры
+watchContainer(lp:FindFirstChildOfClass("PlayerGui"), hideGuiObj, true)
+-- 4) интерфейс Roblox и других скриптов (нужен доступ к CoreGui у экзекутора)
+pcall(function() watchContainer(game:GetService("CoreGui"), hideGuiObj, false) end)
+if hui then watchContainer(hui, hideGuiObj, false) end
+-- 5) ники / HP / метки над головами в мире
+if S.cleanTags then watchContainer(workspace, hideWorldObj, true) end
+-- 6) своя панель и кнопка KILL
+panelWas = gui and gui.Enabled
+if gui then gui.Enabled = false end
+if killGui then killGui.Enabled = false end
+pcall(function() mouseOrig = UIS.MouseIconEnabled end)
+cursor()
+-- ESC-меню Roblox тоже скрыто, поэтому при его открытии сразу возвращаем интерфейс (иначе оно невидимо)
+pcall(function()
+table.insert(cons, GuiService.MenuOpened:Connect(function()
+if S.clean then G.cleanOff() status("Чистый экран выключен (открыто меню)") end
+end))
+end)
+-- игры часто сами включают свой UI обратно — держим его выключенным
+table.insert(cons, RunService.Heartbeat:Connect(function(dt)
+cursor()
+acc = acc + dt
+if acc < 0.25 then return end
+acc = 0
+for o, rec in pairs(saved) do
+if o.Parent then
+pcall(function() if o[rec[1]] ~= rec[3] then o[rec[1]] = rec[3] end end)
+else
+saved[o] = nil
+end
+end
+applyCore()
+if killGui and killGui.Enabled then killGui.Enabled = false end
+end))
+refreshButtons()
+end
+function G.cleanOff()
+if not S.clean then return end
+S.clean = false
+for _, c in ipairs(cons) do pcall(function() c:Disconnect() end) end
+cons = {}
+for o, rec in pairs(saved) do
+if o.Parent then pcall(function() o[rec[1]] = rec[2] end) end
+end
+saved = {}
+for t, v in pairs(coreOrig) do
+pcall(function() StarterGui:SetCoreGuiEnabled(t, v) end)
+end
+coreOrig = {}
+pcall(function() StarterGui:SetCore("TopbarEnabled", topbarOrig ~= false) end)
+pcall(function() UIS.MouseIconEnabled = mouseOrig ~= false end)
+if gui and not gui.Enabled and panelWas then gui.Enabled = true end
+if killGui then killGui.Enabled = S.killUI ~= false end
+refreshButtons()
+end
+function G.toggleClean()
+if S.clean then
+G.cleanOff()
+status("Чистый экран выключен")
+else
+status("Чистый экран: " .. KEYS.CleanScreen.Name .. " — вернуть интерфейс")
+G.cleanOn()
+end
+end
+function G.toggleCleanTags()
+S.cleanTags = not S.cleanTags
+if S.clean then   -- переприменить с новой настройкой, панель оставить как есть
+local vis = gui and gui.Enabled
+G.cleanOff()
+G.cleanOn()
+if gui and vis then gui.Enabled = true end
+end
+status("Чистый экран, ники над головами: " .. (S.cleanTags and "скрывать" or "оставлять"))
+refreshButtons()
+end
+end
 genv.__CinePanelCleanup = function()
+if G.cleanOff then pcall(G.cleanOff) end
 exitAll()
 unbindSink()
 S.timeLock = false
@@ -3844,6 +4030,7 @@ G.step("вкладка", function() showTab("NPC") end)
 G.step("кнопки", refreshButtons)
 G.step("эффект бега", G.initSprintFX)
 G.step("звуки", G.prewarmSfx)
+G.step("чистый экран", G.initClean)
 status("Готово. RightShift — скрыть/показать панель" .. (G.initErr and ("\nОшибки шагов: " .. G.initErr .. "см. консоль F9") or ""))
 end, function(e) return debug.traceback(tostring(e), 2) end)
 if not __cineOk then
