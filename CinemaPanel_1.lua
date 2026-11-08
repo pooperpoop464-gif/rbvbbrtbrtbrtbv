@@ -1042,7 +1042,12 @@ fr[n + 1], fr[n + 2], fr[n + 3] = r3(ps.X), r3(ps.Y), r3(ps.Z)
 fr[n + 4], fr[n + 5], fr[n + 6] = r3(rx), r3(ry), r3(rz)
 end
 if #keys == 0 then return end
-entry.clips = {keys = keys, idle = {f = {fr, fr}, sp = 0}}
+-- NPC в этот момент не анимировался (далеко, «заморожен» игрой) — снимок это просто исходная поза
+-- модели (часто T-поза с руками в стороны). Такой снимок не сохраняем.
+local maxV = 0
+for _, v in ipairs(fr) do maxV = math.max(maxV, math.abs(v)) end
+if maxV < 0.03 then return end
+entry.clips = {keys = keys, idle = {f = {fr, fr}, sp = 0, snap = true}}
 entry._dec = nil
 end
 function G.classifySound(name)
@@ -1596,7 +1601,7 @@ end
 frames[fi] = row
 end
 local fps = c.fps or CLIP_FPS
-out[st] = {n = #frames, len = #frames / fps, fps = fps, sp = c.sp, frames = frames}
+out[st] = {n = #frames, len = #frames / fps, fps = fps, sp = c.sp, frames = frames, snap = c.snap}
 any = true
 end
 end
@@ -1724,6 +1729,8 @@ local c, ck
 for _, k in ipairs(order) do
 if cl[k] then c, ck = cl[k], k break end
 end
+-- «поза стоя» из одного снимка хуже настоящей анимации стояния из игры: если она есть — играет она
+if c and c.snap and e.tracks and e.tracks.idle then c, ck = nil, nil end
 if c then
 stopTracks()
 local scale = 1
@@ -1963,9 +1970,8 @@ ne.clips = dec
 ne.cm = G.buildClipMotors(ne.skin, dec)
 end
 end
-local nv = nc.root.AssemblyLinearVelocity
-local nsp = Vector3.new(nv.X, 0, nv.Z).Magnitude
-if not animateActor(ne, dt, nsp, nc.hum.MoveDirection.Magnitude > 0.05) then
+local nsp = G.ctlSpeed(nc)
+if not animateActor(ne, dt, nsp, G.ctlMoveMag(nc) > 0.05) then
 for _, a in ipairs(ne.arms or {}) do
 if a[1].Parent and a[2] then a[1].Transform = a[2] end
 end
@@ -1973,7 +1979,7 @@ end
 if ne.fakeAtk then G.applyFakeAttack(ne) end
 local ttr = nc.trail
 if ttr then
-local moving = nc.hum.MoveDirection.Magnitude > 0.1
+local moving = G.ctlMoveMag(nc) > 0.1
 local spr = moving and UIS:IsKeyDown(K.LeftShift) and not typing()
 ttr.Enabled = S.ctlTrail and moving
 ttr.Lifetime = spr and 0.9 or 0.45
@@ -2250,7 +2256,16 @@ for _, st in ipairs({"idle", "walk", "run", "attack"}) do clips[st] = old[st] en
 end
 end
 for st, c in pairs(rec) do
-if #c.f >= 6 then
+local maxV = 0
+for _, fr in ipairs(c.f) do
+for _, v in ipairs(fr) do
+local a = math.abs(v)
+if a > maxV then maxV = a end
+end
+if maxV >= 0.03 then break end
+end
+-- все кадры — исходная поза (NPC не анимировался): такая запись даёт T-позу, не сохраняем
+if #c.f >= 6 and maxV >= 0.03 then
 local f = (st ~= "attack") and G.bestLoop(c.f) or c.f
 clips[st] = {f = f, sp = c.nsp > 0 and r3(c.sps / c.nsp) or 0, fps = G.REC_FPS}
 got[#got + 1] = st
@@ -2866,7 +2881,7 @@ hum.RigType = Enum.HumanoidRigType.R15
 hum.HipHeight = geoHip
 end
 end)
-return root, hum
+return root, hum, geoHip
 end
 -- страховка от провала: луч вниз от корня; ушла под пол — поднимаем на пол;
 -- пола нет (пустота или карта не прогрузилась) — возвращаем на последнее место, где стояла на полу
@@ -2912,6 +2927,165 @@ end)
 status("Копия провалилась — возвращена на последнее место на полу")
 end
 end)
+end
+-- ===================== КОНТРОЛЛЕР ДВИЖЕНИЯ БЕЗ ФИЗИКИ (для «Управлять NPC») =====================
+-- копия закреплена (Anchored) и двигается скриптом каждый кадр: никакой физики — значит нечему трясти,
+-- сносить в сторону или проваливать сквозь пол. Высота — лучом вниз, прыжок и падение считаются вручную.
+-- ctl: root, hum, model, hipK (высота центра корня над полом); extraIgnore — что не считать полом/стенами
+function G.startKinematic(ctl, extraIgnore)
+local rr = ctl.root
+-- небольшой «наклон» корня, если он изначально не ровный (сохраняем, чтобы модель не перекосило)
+local look = rr.CFrame.LookVector
+local flat = Vector3.new(look.X, 0, look.Z)
+if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+local yaw0 = math.atan2(-flat.X, -flat.Z)
+ctl.kTilt = CFrame.fromOrientation(0, yaw0, 0):Inverse() * rr.CFrame.Rotation
+ctl.kTiltInv = ctl.kTilt:Inverse()
+ctl.kyaw = yaw0
+ctl.kvel = Vector3.zero
+ctl.kvy = 0
+ctl.kground = false
+ctl.kdir = Vector3.zero
+ctl.hipK = math.max(ctl.hipK or 3, 0.5)
+pcall(function()
+rr.AssemblyLinearVelocity = Vector3.zero
+rr.Anchored = true
+end)
+local ray = RaycastParams.new()
+ray.FilterType = Enum.RaycastFilterType.Exclude
+ray.RespectCanCollide = true
+ray.IgnoreWater = true
+local filtT = 0
+local function lerpAngle(a, b, t)
+local d = (b - a + math.pi) % (2 * math.pi) - math.pi
+return a + d * t
+end
+local function flatUnit(v)
+local f = Vector3.new(v.X, 0, v.Z)
+return f.Magnitude > 0.001 and f.Unit or Vector3.zero
+end
+pcall(function() RunService:UnbindFromRenderStep("CineKin") end)
+RunService:BindToRenderStep("CineKin", Enum.RenderPriority.Camera.Value - 1, function(dt)
+if not (rr.Parent and ctl.hum and ctl.hum.Parent) then return end
+dt = math.min(dt, 0.1)
+filtT = filtT - dt
+if filtT <= 0 then
+filtT = 1
+local ex = {ctl.model}
+for _, x in ipairs(extraIgnore or {}) do ex[#ex + 1] = x end
+if skinFolder then ex[#ex + 1] = skinFolder end
+if fxFolder then ex[#ex + 1] = fxFolder end
+for _, p in ipairs(Players:GetPlayers()) do
+if p.Character then ex[#ex + 1] = p.Character end
+end
+ray.FilterDescendantsInstances = ex
+end
+pcall(function() if not rr.Anchored then rr.Anchored = true end end)
+-- 1) ввод: WASD относительно камеры (или джойстик — через направление настоящего персонажа)
+local dir = Vector3.zero
+local jump = false
+local active = (S.mode == "none" or S.mode == "self") and not typing()
+if active then
+local cam = getCam()
+local fwd = flatUnit(cam.CFrame.LookVector)
+local right = flatUnit(cam.CFrame.RightVector)
+if UIS:IsKeyDown(K.W) then dir = dir + fwd end
+if UIS:IsKeyDown(K.S) then dir = dir - fwd end
+if UIS:IsKeyDown(K.D) then dir = dir + right end
+if UIS:IsKeyDown(K.A) then dir = dir - right end
+if dir.Magnitude < 0.05 then
+local rh = ctl.realHum
+local md = rh and rh.Parent and rh.MoveDirection or Vector3.zero
+if md.Magnitude > 0.05 then dir = flatUnit(md) * math.min(md.Magnitude, 1) end
+end
+if dir.Magnitude > 1 then dir = dir.Unit end
+jump = UIS:IsKeyDown(K.Space)
+end
+ctl.kdir = dir
+-- 2) скорость с плавным разгоном/торможением
+local speed = ctl.hum.WalkSpeed
+local wantV = dir * speed
+ctl.kvel = ctl.kvel:Lerp(wantV, math.min(dt * (dir.Magnitude > 0.05 and 10 or 14), 1))
+if ctl.kvel.Magnitude < 0.05 and dir.Magnitude < 0.05 then ctl.kvel = Vector3.zero end
+local pos = rr.Position
+local step = ctl.kvel * dt
+-- 3) стены (только если «без коллизий» выключено): упёрлись — скользим вдоль стены
+if not S.ctlNoclip and step.Magnitude > 0.001 then
+local rad = math.max(rr.Size.X, rr.Size.Z) / 2 + 0.6
+local hit = workspace:Raycast(pos, step.Unit * (step.Magnitude + rad), ray)
+if hit and hit.Normal.Y < 0.6 then
+local n = flatUnit(hit.Normal)
+if n.Magnitude > 0 then
+step = step - n * math.min(step:Dot(n), 0)
+local back = (hit.Position - pos):Dot(-n)
+if back < rad then step = step + n * (rad - back) * 0.5 end
+end
+end
+end
+local np = pos + step
+-- 4) пол: луч сверху вниз (поэтому копия поднимается на ступеньки)
+local hipK = ctl.hipK
+local stepUp = math.clamp(hipK * 0.5, 1.5, 4)
+local g = workspace:Raycast(np + Vector3.new(0, stepUp, 0), Vector3.new(0, -(stepUp + hipK + 80), 0), ray)
+local gY = g and (g.Position.Y + hipK) or nil
+local y = np.Y
+local grav = workspace.Gravity
+if ctl.kground then
+if jump then
+local jv = 50
+pcall(function()
+if ctl.hum.UseJumpPower then jv = ctl.hum.JumpPower
+else jv = math.sqrt(2 * grav * ctl.hum.JumpHeight) end
+end)
+ctl.kvy = math.max(jv, 25)
+ctl.kground = false
+elseif gY and gY >= y - math.max(1.5, hipK * 0.4) then
+y = y + (gY - y) * math.min(dt * 18, 1)   -- плавно по ступенькам и склонам
+if math.abs(gY - y) < 0.02 then y = gY end
+else
+ctl.kground = false   -- сошёл с уступа — падаем
+ctl.kvy = 0
+end
+end
+if not ctl.kground then
+ctl.kvy = ctl.kvy - grav * dt
+y = y + ctl.kvy * dt
+if gY and y <= gY and ctl.kvy <= 0 then
+y, ctl.kvy, ctl.kground = gY, 0, true
+end
+end
+if ctl.kground then ctl.safePos = Vector3.new(np.X, y, np.Z) end
+-- провалились в пустоту — назад на последнее место на полу
+if not gY and ctl.safePos and y < ctl.safePos.Y - 60 then
+np, y = ctl.safePos, ctl.safePos.Y
+ctl.kvy, ctl.kground, ctl.kvel = 0, true, Vector3.zero
+status("Копия упала в пустоту — возвращена на пол")
+end
+-- 5) поворот: по ходу движения; с зажатой ПКМ в режиме «за себя» — туда, куда смотрит камера
+local base = rr.CFrame * ctl.kTiltInv
+local bl = base.LookVector
+local curYaw = math.atan2(-bl.X, -bl.Z)
+local targetYaw = curYaw
+if S.rmb and S.mode == "self" then
+targetYaw = S.syaw
+elseif ctl.kvel.Magnitude > 0.5 then
+targetYaw = math.atan2(-ctl.kvel.X, -ctl.kvel.Z)
+end
+local yaw = lerpAngle(curYaw, targetYaw, math.min(dt * 12, 1))
+pcall(function()
+rr.CFrame = CFrame.new(np.X, y, np.Z) * CFrame.fromOrientation(0, yaw, 0) * ctl.kTilt
+end)
+end)
+end
+-- движется ли управляемая копия (для анимаций, следа и эффектов бега)
+function G.ctlMoveMag(c)
+if c.kdir then return c.kdir.Magnitude end
+return c.hum.MoveDirection.Magnitude
+end
+function G.ctlSpeed(c)
+if c.kvel then return Vector3.new(c.kvel.X, 0, c.kvel.Z).Magnitude end
+local v = c.root.AssemblyLinearVelocity
+return Vector3.new(v.X, 0, v.Z).Magnitude
 end
 local function startPuppet()
 if puppet then return end
@@ -3069,8 +3243,8 @@ model:Destroy()
 status("У NPC нет корневой части")
 return
 end
-local hum
-root, hum = G.prepWalker(model, root)
+local hum, geoHip
+root, hum, geoHip = G.prepWalker(model, root)
 pcall(function() root.CanCollide = true end)
 local ohum = humOf(orig)
 pcall(function()
@@ -3098,7 +3272,8 @@ e.arms = G.buildArms(model, root)
 e.limbs = G.buildLimbs(model, root)
 e.procedural = true
 npcCtl = {orig = orig, model = model, hum = hum, root = root, e = e, realRoot = realRoot,
-wasAnchored = realRoot.Anchored, temp = temp, baseSpeed = hum.WalkSpeed}
+wasAnchored = realRoot.Anchored, temp = temp, baseSpeed = hum.WalkSpeed,
+realHum = char and char:FindFirstChildOfClass("Humanoid")}
 -- без коллизий: Humanoid сам возвращает CanCollide части тела, поэтому гасим его каждый физический шаг
 npcCtl.parts = {}
 for _, d in ipairs(model:GetDescendants()) do
@@ -3110,7 +3285,8 @@ if c and S.ctlNoclip then
 for _, part in ipairs(c.parts) do part.CanCollide = false end
 end
 end)
-npcCtl.groundConn = G.groundGuard(npcCtl, {orig})
+npcCtl.hipK = (geoHip or 0) + root.Size.Y / 2
+G.startKinematic(npcCtl, {orig})
 -- красная полоса (Trail) от спины NPC: две точки на спине, шлейф тянется назад при движении
 pcall(function()
 local size = model:GetExtentsSize()
@@ -3161,6 +3337,7 @@ local c = npcCtl
 npcCtl = nil
 if c.stepConn then c.stepConn:Disconnect() end
 if c.groundConn then c.groundConn:Disconnect() end
+pcall(function() RunService:UnbindFromRenderStep("CineKin") end)
 pcall(function() c.model:Destroy() end)
 pcall(vhShow, c.orig, "ctl")
 local rr = c.realRoot
@@ -3830,6 +4007,7 @@ pcall(function() hum.WalkSpeed = npcCtl.baseSpeed * mul end)
 end
 -- поворот: ПКМ зажат -> NPC плавно смотрит туда же, куда камера (можно идти боком); отпущен -> NPC поворачивается по ходу движения
 local rr = ctl.root
+if ctl.kTilt then return end   -- копией управляет контроллер без физики (G.startKinematic)
 if S.rmb and S.mode == "self" and rr and rr.Parent then
 pcall(function()
 hum.AutoRotate = false
@@ -3989,7 +4167,7 @@ local k = 0
 connect(RunService.RenderStepped, function(dt)
 local c = npcCtl
 local want = 0
-if c and c.hum.Parent and not typing() and UIS:IsKeyDown(K.LeftShift) and c.hum.MoveDirection.Magnitude > 0.1 then
+if c and c.hum.Parent and not typing() and UIS:IsKeyDown(K.LeftShift) and G.ctlMoveMag(c) > 0.1 then
 want = 1
 end
 k = k + (want - k) * math.min(dt * (want > k and 6 or 4), 1)
