@@ -155,6 +155,8 @@ ctlNoclip = true,   -- копия NPC проходит сквозь стены/�
 hitPlayers = false, -- визуальные удары/KILL по обычным игрокам (видно только тебе)
 clean = false,      -- «чистый экран»: весь интерфейс скрыт (для записи видео)
 cleanTags = true,   -- в чистом экране прятать и ники / полоски HP / метки над головами
+antiIdle = true,    -- анти-бездействие: персонаж сам шевелится, если долго стоит
+idleInt = 10,       -- через сколько секунд без движения шевелиться
 }
 local npcs = {}
 local npcCtl = nil          -- визуальное управление настоящим NPC (копия, оригинал скрыт только у тебя)
@@ -167,6 +169,15 @@ end
 local seen = setmetatable({}, {__mode = "k"})
 local seenCounter = 0
 local status = function(_) end
+-- запуск функции кнопки/клавиши: при ошибке не «молчим», а пишем причину в строку статуса и в консоль (F9)
+function G.safeRun(fn, label)
+local ok, err = pcall(fn)
+if not ok then
+local msg = tostring(err)
+warn("[CinePanel] ошибка в «" .. tostring(label) .. "»: " .. msg)
+pcall(status, "Ошибка (" .. tostring(label) .. "): " .. string.sub(msg, 1, 90))
+end
+end
 local refreshButtons = function() end
 local rebuildNPCList = function() end
 local rebuildCamList = function() end
@@ -574,7 +585,10 @@ status("Здоровье восстановлено")
 end
 end
 local PRESETS = {"Huggy Wuggy", "Kissy Missy", "Mommy Long Legs", "CatNap"}
-local CLIP_FPS = 15      -- частота записи поз (кадров/с) для копирования анимаций
+local CLIP_FPS = 15      -- частота старых записей поз (для клипов без поля fps)
+G.REC_FPS = 30           -- частота новых записей поз (плавнее)
+G.RUN_SPEED = 18         -- с какой скорости движение считается бегом (одинаково при записи и воспроизведении)
+G.BLEND = 0.2            -- плавный переход между анимациями (с)
 local ARM_DOWN = 1.4   -- насколько (рад.) опускать руки R15, если у источника нет позы/анимации
 local LIB_FILE = "CinePanel_library.json"
 local LIB, libSel = {}, nil
@@ -796,10 +810,30 @@ local unsup = 0
 for i, e in ipairs(desc.parts) do
 local p
 if e.mid and e.mid ~= "" then
+-- 1) настоящий MeshPart из ID меша (кэш: один и тот же меш грузится один раз)
+G.meshCache = G.meshCache or {}
+local tpl = G.meshCache[e.mid]
+if tpl == nil and (G.meshAsyncFails or 0) < 3 then
+local ok3, mp3 = pcall(function()
+return game:GetService("AssetService"):CreateMeshPartAsync(e.mid)
+end)
+if ok3 and mp3 then
+tpl = mp3
+G.meshAsyncFails = 0
+else
+tpl = false
+G.meshAsyncFails = (G.meshAsyncFails or 0) + 1   -- 3 сбоя подряд — метод недоступен, больше не ждём
+end
+G.meshCache[e.mid] = tpl
+end
+if tpl then p = tpl:Clone() end
+-- 2) запасной путь: прямая запись MeshId (в большинстве игр запрещена, но иногда работает)
+if not p then
 local ok, mp = pcall(Instance.new, "MeshPart")
 if ok and mp then
 local ok2 = pcall(function() mp.MeshId = e.mid end)
 if ok2 and mp.MeshId ~= "" then p = mp else mp:Destroy() end
+end
 end
 end
 if not p then
@@ -813,7 +847,10 @@ if e.mid and e.mid ~= "" then
 local sm = Instance.new("SpecialMesh")
 sm.MeshType = Enum.MeshType.FileMesh
 sm.MeshId = e.mid
-sm.TextureId = e.tid or ""
+-- если текстура была в SurfaceAppearance (PBR) — берём её цветовую карту, иначе меш будет серым
+local tex = e.tid or ""
+if tex == "" and e.sa and e.sa.c and e.sa.c ~= "" then tex = e.sa.c end
+sm.TextureId = tex
 local ms = e.msz or {1, 1, 1}
 local function sc(a, b) return (b and b > 0.001) and (a / b) or 1 end
 sm.Scale = Vector3.new(sc(e.sz[1], ms[1]), sc(e.sz[2], ms[2]), sc(e.sz[3], ms[3]))
@@ -856,11 +893,15 @@ tx.Transparency = tt.tr or 0
 tx.Parent = p
 end
 if e.sa and p:IsA("MeshPart") then
-pcall(function()
+local okSA = pcall(function()
 local sa = Instance.new("SurfaceAppearance")
 sa.ColorMap, sa.NormalMap, sa.MetalnessMap, sa.RoughnessMap = e.sa.c, e.sa.n, e.sa.m, e.sa.r
 sa.Parent = p
 end)
+-- карты SurfaceAppearance обычно закрыты для скриптов: тогда кладём цветовую карту как обычную текстуру
+if not okSA and e.sa.c and e.sa.c ~= "" and (p.TextureID == "" or not e.tid or e.tid == "") then
+pcall(function() p.TextureID = e.sa.c end)
+end
 end
 p.CFrame = CFrame.new(table.unpack(e.cf))
 p.Parent = model
@@ -1554,7 +1595,8 @@ row[j] = CFrame.new(fr[b + 1], fr[b + 2], fr[b + 3])
 end
 frames[fi] = row
 end
-out[st] = {n = #frames, len = #frames / CLIP_FPS, sp = c.sp, frames = frames}
+local fps = c.fps or CLIP_FPS
+out[st] = {n = #frames, len = #frames / fps, fps = fps, sp = c.sp, frames = frames}
 any = true
 end
 end
@@ -1576,9 +1618,21 @@ if j then list[#list + 1] = {it[1], j} end
 end
 return list
 end
-function G.applyClip(e, c, t, loop)
+-- запомнить текущую позу, чтобы плавно перетечь из неё в следующую анимацию
+function G.startBlend(e, key)
+if e.clipKey == key then return end
+e.clipKey = key
+e.blendFrom = {}
+for _, pr in ipairs(e.cm or {}) do
+local m = pr[1]
+if m.Parent then e.blendFrom[m] = m.Transform end
+end
+e.blendT0 = os.clock()
+end
+function G.applyClip(e, c, t, loop, key)
+G.startBlend(e, key or c)
 local n = c.n
-local pos = t * CLIP_FPS
+local pos = t * (c.fps or CLIP_FPS)
 local i = math.floor(pos)
 local a = pos - i
 local ia, ib
@@ -1587,12 +1641,52 @@ ia, ib = i % n + 1, (i + 1) % n + 1
 else
 ia, ib = math.min(i + 1, n), math.min(i + 2, n)
 end
+local w = 1
+if e.blendFrom then
+w = (os.clock() - e.blendT0) / G.BLEND
+if w >= 1 then e.blendFrom, w = nil, 1 end
+end
+-- сглаживание (ease in-out), чтобы переход не был «ступенькой»
+local ws = w * w * (3 - 2 * w)
 local fa, fb = c.frames[ia], c.frames[ib]
 for _, pr in ipairs(e.cm) do
 local m, j = pr[1], pr[2]
 local x, y = fa[j], fb[j]
-if x and y and m.Parent then m.Transform = x:Lerp(y, a) end
+if x and y and m.Parent then
+local cf = x:Lerp(y, a)
+if w < 1 then
+local f0 = e.blendFrom[m]
+if f0 then cf = f0:Lerp(cf, ws) end
 end
+m.Transform = cf
+end
+end
+end
+-- обрезать цикл (стоя/ходьба/бег) там, где поза ближе всего к первому кадру: без рывка на стыке
+function G.bestLoop(f)
+local n = #f
+if n < 12 then return f end
+local first = f[1]
+local function dist(fr)
+local d = 0
+for b = 1, #first, 6 do
+for k = 0, 2 do d = d + math.abs((fr[b + k] or 0) - first[b + k]) end
+for k = 3, 5 do
+local x = math.abs((fr[b + k] or 0) - first[b + k]) % (2 * math.pi)
+d = d + math.min(x, 2 * math.pi - x) * 2
+end
+end
+return d
+end
+local best, bestD = n + 1, dist(f[n]) * 1.15   -- немного предпочитаем полную длину
+for k = math.max(8, math.floor(n * 0.45)), n do
+local d = dist(f[k])
+if d < bestD then best, bestD = k, d end
+end
+if best > n then return f end
+local out = {}
+for k = 1, best - 1 do out[k] = f[k] end   -- кадр best ≈ кадр 1, поэтому сам он не нужен
+return out
 end
 local function animateActor(e, dt, sp, hint)
 e.sm = (e.sm or sp) * 0.7 + sp * 0.3
@@ -1602,29 +1696,41 @@ elseif e.sm > 2.5 or hint then
 e.moving = true
 end
 local want = "idle"
-if e.moving then want = (e.sm > 18) and "run" or "walk" end
+if e.moving then want = (e.sm > G.RUN_SPEED) and "run" or "walk" end
 local useRecorded = not (S.basicAnim and e.limbs and #e.limbs > 0)
 local lackMove = false -- нет записи ходьбы -> процедурная ходьба вместо скольжения в позе idle
 local cl = e.clips
+-- записанная поза и анимация игры не должны играть одновременно (иначе поза «смешивается» и кривится)
+local function stopTracks()
+if e.tracks and e.state then
+for _, tr in pairs(e.tracks) do
+if tr.IsPlaying then tr:Stop(0.1) end
+end
+e.state = nil
+end
+end
 if useRecorded and cl and e.cm and #e.cm > 0 then
 if e.atkT0 and cl.attack then
 local t = os.clock() - e.atkT0
 if t < cl.attack.len then
-G.applyClip(e, cl.attack, t, false)
+stopTracks()
+G.applyClip(e, cl.attack, t, false, "attack")
 return true
 end
 e.atkT0 = nil
 end
 local order = (want == "run" and {"run", "walk"}) or (want == "walk" and {"walk", "run"}) or {"idle"}
-local c
+local c, ck
 for _, k in ipairs(order) do
-if cl[k] then c = cl[k] break end
+if cl[k] then c, ck = cl[k], k break end
 end
 if c then
+stopTracks()
 local scale = 1
 if want ~= "idle" and c.sp and c.sp > 0.5 then scale = math.clamp(e.sm / c.sp, 0.5, 2) end
+if ck ~= e.clipKey then e.ct = 0 end   -- новая анимация начинается с начала цикла
 e.ct = (e.ct or 0) + dt * scale
-G.applyClip(e, c, e.ct, true)
+G.applyClip(e, c, e.ct, true, ck)
 return true
 elseif want ~= "idle" then
 lackMove = true
@@ -1639,6 +1745,7 @@ end
 if not ok then e.tracks, e.motors = nil, (e.fb or {}) end
 end
 end
+e.clipKey = nil   -- дальше не записанный клип: следующий клип начнёт плавный переход заново
 if useRecorded and e.tracks then
 local w = want
 if not e.tracks[w] then
@@ -2046,16 +2153,18 @@ function G.observeAnims(model, entry, duration)
 G.observeSounds(model, entry, duration)
 task.spawn(function()
 entry.anim = entry.anim or {}
-local motors, keys = {}, {}
+local motors, keys, rest = {}, {}, {}
 for _, it in ipairs(G.motorKeys(model)) do
 motors[#motors + 1] = it[1]
 keys[#keys + 1] = it[2]
+rest[#rest + 1] = it[1].C0:Inverse()   -- исходное положение сустава (как у копии)
 end
 local function r3(x) return math.floor(x * 1000 + 0.5) / 1000 end
 local function sample()
 local fr = {}
-for _, m in ipairs(motors) do
-local cf = m.Transform
+for i, m in ipairs(motors) do
+-- полная поза сустава: и анимация (Transform), и сдвиг сустава скриптом игры (C0)
+local cf = rest[i] * m.C0 * m.Transform
 local ps = cf.Position
 local rx, ry, rz = cf:ToEulerAnglesYXZ()
 local n = #fr
@@ -2066,6 +2175,7 @@ return fr
 end
 local LIM = {idle = 3, walk = 2.4, run = 2, attack = 3.5}
 local rec, prev, smooth, moving = {}, nil, 0, false
+local lastT
 local speedOf = G.speedTracker()
 local t0 = os.clock()
 while os.clock() - t0 < duration and model.Parent do
@@ -2079,7 +2189,7 @@ elseif smooth > 2.5 then
 moving = true
 end
 local isAtk = false
-local key = moving and (smooth > 14 and "run" or "walk") or "idle"
+local key = moving and (smooth > G.RUN_SPEED and "run" or "walk") or "idle"
 for _, t in ipairs(G.livePlayingIds(model)) do
 local nm = string.lower(t.name or "")
 local atk = (not t.looped) or nm:find("attack") or nm:find("kill") or nm:find("grab")
@@ -2115,13 +2225,17 @@ if not c then
 c = {f = {}, sps = 0, nsp = 0}
 rec[state] = c
 end
-if not c.closed and #c.f < LIM[state] * CLIP_FPS then
+if not c.closed and #c.f < LIM[state] * G.REC_FPS then
 c.f[#c.f + 1] = sample()
 c.sps, c.nsp = c.sps + smooth, c.nsp + 1
 end
 end
 end
-task.wait(1 / CLIP_FPS)
+-- ровный шаг записи по часам (task.wait может «плыть»)
+local nextT = (lastT or os.clock()) + 1 / G.REC_FPS
+lastT = nextT
+local now = os.clock()
+if nextT > now then task.wait(nextT - now) else lastT = now end
 end
 -- объединяем с прошлой записью (если набор суставов тот же), а не стираем её
 local clips, got = {keys = keys}, {}
@@ -2137,7 +2251,8 @@ end
 end
 for st, c in pairs(rec) do
 if #c.f >= 6 then
-clips[st] = {f = c.f, sp = c.nsp > 0 and r3(c.sps / c.nsp) or 0}
+local f = (st ~= "attack") and G.bestLoop(c.f) or c.f
+clips[st] = {f = f, sp = c.nsp > 0 and r3(c.sps / c.nsp) or 0, fps = G.REC_FPS}
 got[#got + 1] = st
 end
 end
@@ -2701,6 +2816,103 @@ if tgt.Parent or fights[tgt] then pcall(landHit, tgt) end
 end)
 end
 end
+-- ===================== ОБЩАЯ ПОДГОТОВКА ХОДЯЧЕЙ КОПИИ (кукла и «Управлять NPC») =====================
+-- 1) Humanoid двигает только часть с именем HumanoidRootPart. Если корень называется иначе, копия не ходит:
+--    добавляем невидимый ровный корень и привариваем модель к нему.
+-- 2) У R6 (и у нового Humanoid по умолчанию) высота над полом не работает — он стоит только на столкновении
+--    ног, а у копии ноги без коллизий, поэтому она проваливается. В режиме R15 Humanoid сам держит корень
+--    на высоте HipHeight над полом, коллизии ног не нужны.
+function G.prepWalker(model, root)
+if root.Name ~= "HumanoidRootPart" then
+local look = root.CFrame.LookVector
+local flat = Vector3.new(look.X, 0, look.Z)
+if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+local hrp = Instance.new("Part")
+hrp.Name = "HumanoidRootPart"
+hrp.Size = Vector3.new(2, 2, 1)
+hrp.Transparency = 1
+hrp.CanTouch, hrp.CanQuery, hrp.Massless = false, false, false
+hrp.CFrame = CFrame.lookAt(root.Position, root.Position + flat.Unit)
+pcall(function() hrp.RootPriority = 127 end)
+local w = Instance.new("Weld")
+w.Part0, w.Part1 = hrp, root
+w.C0 = hrp.CFrame:ToObjectSpace(root.CFrame)
+w.Parent = hrp
+hrp.Parent = model
+root = hrp
+end
+model.PrimaryPart = root
+-- высота от низа корня до самой нижней видимой части (с учётом поворота частей)
+local geoHip = 0
+local minY = math.huge
+for _, d in ipairs(model:GetDescendants()) do
+if d:IsA("BasePart") and d ~= root and d.Transparency < 1 then
+local cf = d.CFrame
+local half = math.abs(cf.RightVector.Y) * d.Size.X / 2 + math.abs(cf.UpVector.Y) * d.Size.Y / 2
++ math.abs(cf.LookVector.Y) * d.Size.Z / 2
+minY = math.min(minY, d.Position.Y - half)
+end
+end
+if minY < math.huge then geoHip = math.max((root.Position.Y - root.Size.Y / 2) - minY, 0) end
+local hum = model:FindFirstChildOfClass("Humanoid")
+if not hum then -- модель на AnimationController: создаём Humanoid
+hum = Instance.new("Humanoid")
+hum.Parent = model
+end
+pcall(function()
+hum.AutomaticScalingEnabled = false
+if hum.RigType ~= Enum.HumanoidRigType.R15 or hum.HipHeight < 0.2 then
+hum.RigType = Enum.HumanoidRigType.R15
+hum.HipHeight = geoHip
+end
+end)
+return root, hum
+end
+-- страховка от провала: луч вниз от корня; ушла под пол — поднимаем на пол;
+-- пола нет (пустота или карта не прогрузилась) — возвращаем на последнее место, где стояла на полу
+function G.groundGuard(ctl, extraIgnore)
+local ray = RaycastParams.new()
+ray.FilterType = Enum.RaycastFilterType.Exclude
+ray.RespectCanCollide = true   -- невидимые триггеры без коллизии не считаются полом
+ray.IgnoreWater = true
+local filtT = 0
+return RunService.Heartbeat:Connect(function(dt)
+local rp, hum = ctl.root, ctl.hum
+if not (rp and rp.Parent and hum) then return end
+filtT = filtT - dt
+if filtT <= 0 then
+filtT = 1
+local ex = {ctl.model}
+for _, x in ipairs(extraIgnore or {}) do ex[#ex + 1] = x end
+if skinFolder then ex[#ex + 1] = skinFolder end
+if fxFolder then ex[#ex + 1] = fxFolder end
+for _, p in ipairs(Players:GetPlayers()) do
+if p.Character then ex[#ex + 1] = p.Character end
+end
+ray.FilterDescendantsInstances = ex
+end
+local hip = hum.HipHeight + rp.Size.Y / 2
+-- луч из центра корня: так копия не «запрыгивает» на столы и балки над полом
+local hit = workspace:Raycast(rp.Position, Vector3.new(0, -(hip + 40), 0), ray)
+local v = rp.AssemblyLinearVelocity
+if hit then
+local wantY = hit.Position.Y + hip
+if rp.Position.Y < wantY - 0.6 then
+pcall(function()
+rp.CFrame = rp.CFrame + Vector3.new(0, wantY - rp.Position.Y, 0)
+if v.Y < 0 then rp.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z) end
+end)
+end
+if rp.Position.Y - wantY < 1.5 then ctl.safeCF = rp.CFrame end
+elseif ctl.safeCF and rp.Position.Y < ctl.safeCF.Position.Y - 25 then
+pcall(function()
+rp.CFrame = ctl.safeCF
+rp.AssemblyLinearVelocity = Vector3.zero
+end)
+status("Копия провалилась — возвращена на последнее место на полу")
+end
+end)
+end
 local function startPuppet()
 if puppet then return end
 if npcCtl then G.stopNpcCtl() end
@@ -2724,11 +2936,6 @@ d.CanCollide = (d.Name == "HumanoidRootPart")
 end
 end)
 end
-local hum = model:FindFirstChildOfClass("Humanoid")
-if not hum then
-hum = Instance.new("Humanoid")
-hum.Parent = model
-end
 local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
 or model:FindFirstChildWhichIsA("BasePart", true)
 if not root then
@@ -2736,7 +2943,9 @@ model:Destroy()
 status("У модели нет корневой части")
 return
 end
-model.PrimaryPart = root
+local hum
+root, hum = G.prepWalker(model, root)
+pcall(function() root.CanCollide = true end)
 pcall(function()
 hum.RequiresNeck = false
 hum.BreakJointsOnDeath = false
@@ -2763,6 +2972,7 @@ e.limbs = G.buildLimbs(model, root)
 e.procedural = true
 puppet = {model = model, hum = hum, root = root, e = e, realRoot = realRoot, realHum = realHum,
 wasAnchored = realRoot.Anchored, origCF = origCF}
+puppet.groundConn = G.groundGuard(puppet)
 removeSkin(char) -- скин с настоящего персонажа снимаем
 local up = workspace.StreamingEnabled and 250 or 2500
 pcall(function()
@@ -2782,6 +2992,7 @@ stopPuppet = function()
 if not puppet then return end
 local p = puppet
 puppet = nil
+if p.groundConn then p.groundConn:Disconnect() end
 local cf = (p.root and p.root.Parent) and p.root.CFrame or p.origCF
 pcall(function() p.model:Destroy() end)
 local rr = p.realRoot
@@ -2839,6 +3050,7 @@ if not entry.sounds then entry.sounds = {} end
 pcall(G.readSounds, orig, entry)
 local model = cloneModel(orig)
 if not model then status("Не удалось скопировать NPC") return end
+local pv0 = model:GetPivot()   -- положение копии до правок (для точной постановки на место оригинала)
 for _, d in ipairs(model:GetDescendants()) do
 pcall(function()
 if d:IsA("LuaSourceContainer") or d:IsA("ProximityPrompt") or d:IsA("ClickDetector")
@@ -2857,19 +3069,10 @@ model:Destroy()
 status("У NPC нет корневой части")
 return
 end
-model.PrimaryPart = root
+local hum
+root, hum = G.prepWalker(model, root)
 pcall(function() root.CanCollide = true end)
 local ohum = humOf(orig)
-local hum = model:FindFirstChildOfClass("Humanoid")
-if not hum then -- NPC на AnimationController: создаём Humanoid, высоту подбираем по самой нижней части
-local minY = math.huge
-for _, d in ipairs(model:GetDescendants()) do
-if d:IsA("BasePart") then minY = math.min(minY, d.Position.Y - d.Size.Y / 2) end
-end
-hum = Instance.new("Humanoid")
-hum.HipHeight = math.max((root.Position.Y - minY) - root.Size.Y / 2, 0)
-hum.Parent = model
-end
 pcall(function()
 hum.RequiresNeck = false
 hum.BreakJointsOnDeath = false
@@ -2883,7 +3086,8 @@ hum.EvaluateStateMachine = true
 end)
 model.Name = "CineNPCCtl"
 model.Parent = getSkinFolder()
-pcall(function() model:PivotTo(orig:GetPivot()) end)
+-- ставим копию ровно на место оригинала (смена корня не должна её разворачивать)
+pcall(function() model:PivotTo(orig:GetPivot() * pv0:Inverse() * model:GetPivot()) end)
 vhHide(orig, "ctl") -- оригинал скрыт только у тебя
 local e = {skin = model, root = root, t0 = os.clock(), motors = {}, fb = {}, entry = entry}
 e.tracks, e.attack = G.setupTracks(model, entry)
@@ -2906,6 +3110,7 @@ if c and S.ctlNoclip then
 for _, part in ipairs(c.parts) do part.CanCollide = false end
 end
 end)
+npcCtl.groundConn = G.groundGuard(npcCtl, {orig})
 -- красная полоса (Trail) от спины NPC: две точки на спине, шлейф тянется назад при движении
 pcall(function()
 local size = model:GetExtentsSize()
@@ -2955,6 +3160,7 @@ if not npcCtl then return end
 local c = npcCtl
 npcCtl = nil
 if c.stepConn then c.stepConn:Disconnect() end
+if c.groundConn then c.groundConn:Disconnect() end
 pcall(function() c.model:Destroy() end)
 pcall(vhShow, c.orig, "ctl")
 local rr = c.realRoot
@@ -3208,7 +3414,7 @@ if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
 local kc = input.KeyCode
 for name, key in pairs(KEYS) do
 if key == kc and ACTIONS[name] then
-ACTIONS[name]()
+G.safeRun(ACTIONS[name], name)
 return
 end
 end
@@ -3310,7 +3516,7 @@ local b = new("TextButton", {Text = text, BackgroundColor3 = BTN, TextColor3 = T
 TextSize = 12, BorderSizePixel = 0}, parent)
 if props then for k, v in pairs(props) do b[k] = v end end
 styleBtn(b)
-b.MouseButton1Click:Connect(cb)
+b.MouseButton1Click:Connect(function() G.safeRun(cb, text) end)
 return b
 end
 local closeBtn = btn(titleBar, "X", function()
@@ -3455,7 +3661,9 @@ end
 end
 do
 local p = pages["Мир"]
-local g = grid(p, 284)
+local g = grid(p, 318)
+B.antiIdle = gbtn(g, "", function() if G.toggleAntiIdle then G.toggleAntiIdle() end end)
+B.idleInt = gbtn(g, "", function() if G.cycleIdleInt then G.cycleIdleInt() end end)
 B.clean = gbtn(g, "", function() if G.toggleClean then G.toggleClean() end end)
 B.cleanTags = gbtn(g, "", function() if G.toggleCleanTags then G.toggleCleanTags() end end)
 B.night = gbtn(g, "День <-> Ночь", toggleDayNight)
@@ -3478,11 +3686,11 @@ B.sfx = gbtn(g, "", function() S.sfx = not S.sfx refreshButtons() end)
 gbtn(g, "Копировать звуки NPC", G.copySounds)
 B.trail = gbtn(g, "", function() S.ctlTrail = not S.ctlTrail refreshButtons() end)
 gbtn(g, "Тест звуков", function() G.testSfx() end)
-B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 290),
+B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 324),
 BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
 TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
 local function sbox(cat, ph, i)
-local b = new("TextBox", {Size = UDim2.new(1 / 3, -4, 0, 24), Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 336),
+local b = new("TextBox", {Size = UDim2.new(1 / 3, -4, 0, 24), Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 370),
 PlaceholderText = ph, Text = "", ClearTextOnFocus = false, BackgroundColor3 = PANEL, TextColor3 = TXT,
 PlaceholderColor3 = Color3.fromRGB(140, 140, 150), Font = Enum.Font.Gotham, TextSize = 11, BorderSizePixel = 0}, p)
 new("UICorner", {CornerRadius = UDim.new(0, 5)}, b)
@@ -3701,6 +3909,9 @@ B.puppet2.Text = "Кукла: " .. (puppet and "ВКЛ" or "ВЫКЛ")
 B.smooth.Text = "Плавно: " .. (S.smooth and "ВКЛ" or "ВЫКЛ")
 B.markers.Text = "Маркеры: " .. (S.markers and "ВКЛ" or "ВЫКЛ")
 B.hideSelf.Text = "Скрывать и себя: " .. (S.hideSelf and "ДА" or "НЕТ")
+mark(B.antiIdle, S.antiIdle)
+B.antiIdle.Text = "Анти-бездействие: " .. (S.antiIdle and "ВКЛ" or "ВЫКЛ")
+B.idleInt.Text = "Шевелиться каждые: " .. S.idleInt .. " с"
 mark(B.clean, S.clean)
 B.clean.Text = "Чистый экран (" .. KEYS.CleanScreen.Name .. ")"
 mark(B.cleanTags, S.cleanTags)
@@ -3980,7 +4191,86 @@ status("Чистый экран, ники над головами: " .. (S.clean
 refreshButtons()
 end
 end
+-- ===================== АНТИ-БЕЗДЕЙСТВИЕ (игры, где убивают за то, что стоишь на месте) =====================
+-- если твой персонаж долго не двигается (например, ты снимаешь через Freecam), он сам прыгает,
+-- делает шаг в сторону и возвращается на то же место. Плюс защита от кика Roblox за 20 минут AFK.
+function G.initAntiIdle()
+local INTERVALS = {5, 10, 20, 40}
+local DIRS = {Vector3.new(1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(-1, 0, 0), Vector3.new(0, 0, -1)}
+local gen, di = 0, 0
+-- кик Roblox «disconnected for being idle»
+pcall(function()
+local VU = game:GetService("VirtualUser")
+connect(lp.Idled, function()
+if not S.antiIdle then return end
+pcall(function()
+VU:CaptureController()
+VU:ClickButton2(Vector2.new())
+end)
+end)
+end)
+local function waitNear(root, pos, maxT)
+local t0 = os.clock()
+while os.clock() - t0 < maxT and root.Parent do
+local d = root.Position - pos
+if Vector3.new(d.X, 0, d.Z).Magnitude < 1 then return end
+task.wait(0.1)
+end
+end
+local function nudge()
+local char = lp.Character
+local hum = char and char:FindFirstChildOfClass("Humanoid")
+local root = char and char:FindFirstChild("HumanoidRootPart")
+if not (hum and root) or hum.Health <= 0 or root.Anchored or hum.Sit then return end
+local home = root.Position
+di = di % #DIRS + 1
+local away = home + DIRS[di] * 3
+pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+pcall(function() hum:MoveTo(away) end)
+waitNear(root, away, 1.2)
+pcall(function() hum:MoveTo(home) end)
+waitNear(root, home, 1.5)
+end
+function G.antiIdleStart()
+gen = gen + 1
+local my = gen
+task.spawn(function()
+local lastPos, lastMove = nil, os.clock()
+while S.antiIdle and gen == my do
+task.wait(0.5)
+local char = lp.Character
+local root = char and char:FindFirstChild("HumanoidRootPart")
+if root then
+if not lastPos or (root.Position - lastPos).Magnitude > 1.5 then
+lastPos, lastMove = root.Position, os.clock()
+elseif os.clock() - lastMove >= S.idleInt then
+pcall(nudge)
+lastPos, lastMove = root.Position, os.clock()
+end
+end
+end
+end)
+end
+function G.toggleAntiIdle()
+S.antiIdle = not S.antiIdle
+if S.antiIdle then G.antiIdleStart() else gen = gen + 1 end
+status("Анти-бездействие: " .. (S.antiIdle and ("ВКЛ (каждые " .. S.idleInt .. " с без движения)") or "ВЫКЛ"))
+refreshButtons()
+end
+function G.cycleIdleInt()
+local nxt = INTERVALS[1]
+for i, v in ipairs(INTERVALS) do
+if v == S.idleInt then nxt = INTERVALS[i % #INTERVALS + 1] break end
+end
+S.idleInt = nxt
+status("Шевелиться через " .. nxt .. " с без движения")
+refreshButtons()
+end
+function G.antiIdleStop() gen = gen + 1 end
+if S.antiIdle then G.antiIdleStart() end
+end
 genv.__CinePanelCleanup = function()
+if G.antiIdleStop then pcall(G.antiIdleStop) end
 if G.cleanOff then pcall(G.cleanOff) end
 exitAll()
 unbindSink()
@@ -4031,6 +4321,7 @@ G.step("кнопки", refreshButtons)
 G.step("эффект бега", G.initSprintFX)
 G.step("звуки", G.prewarmSfx)
 G.step("чистый экран", G.initClean)
+G.step("анти-бездействие", G.initAntiIdle)
 status("Готово. RightShift — скрыть/показать панель" .. (G.initErr and ("\nОшибки шагов: " .. G.initErr .. "см. консоль F9") or ""))
 end, function(e) return debug.traceback(tostring(e), 2) end)
 if not __cineOk then
