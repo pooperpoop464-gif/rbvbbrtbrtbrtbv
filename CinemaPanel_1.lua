@@ -84,6 +84,7 @@ SelfView    = K.Backquote,
 ReviveAll   = K.PageUp,
 Exit        = K.Backspace,
 CleanScreen = K.RightControl,
+Follow      = K.J,
 }
 local KEY_LABELS = {
 {"TogglePanel", "Показать/скрыть панель"},
@@ -115,6 +116,7 @@ local KEY_LABELS = {
 {"ReviveAll", "Вернуть всех"},
 {"Exit", "Выйти из всех режимов"},
 {"CleanScreen", "Чистый экран (скрыть весь UI)"},
+{"Follow", "3-е лицо: авто-камера за спиной NPC"},
 }
 local genv = (getgenv and getgenv()) or _G
 if genv.__CinePanelCleanup then pcall(genv.__CinePanelCleanup) end
@@ -154,6 +156,9 @@ ctlTrail = true,    -- красный хвост от спины управля�
 ctlNoclip = true,   -- копия NPC проходит сквозь стены/игроков/NPC
 hitPlayers = false, -- визуальные удары/KILL по обычным игрокам (видно только тебе)
 clean = false,      -- «чистый экран»: весь интерфейс скрыт (для записи видео)
+follow = true,       -- 3-е лицо: камера сама держится за спиной NPC
+followK = 5,        -- скорость доворота камеры за спину (больше = жёстче)
+fOff = 0,           -- смещение камеры мышью от «за спиной» (возвращается к 0)
 cleanTags = true,   -- в чистом экране прятать и ники / полоски HP / метки над головами
 antiIdle = true,    -- анти-бездействие: персонаж сам шевелится, если долго стоит
 idleInt = 10,       -- через сколько секунд без движения шевелиться
@@ -235,7 +240,17 @@ for p in pairs(fpHidden) do
 if p.Parent then p.LocalTransparencyModifier = 0 end
 end
 fpHidden = {}
+for p in pairs(G.fpInside or {}) do
+if p.Parent then p.LocalTransparencyModifier = 0 end
+end
+G.fpInside = {}
+G.fpParts = {}
+G.fpEye = nil
+G.fpPos = nil
 if on and S.target then
+for _, d in ipairs(S.target:GetDescendants()) do
+if d:IsA("BasePart") then table.insert(G.fpParts, d) end
+end
 local head = S.target:FindFirstChild("Head")
 for _, d in ipairs(S.target:GetDescendants()) do
 if d:IsA("BasePart") and (d == head or (d.Parent and d.Parent:IsA("Accessory"))) then
@@ -288,6 +303,9 @@ local look = r.CFrame.LookVector
 local _, y = CFrame.lookAt(Vector3.zero, Vector3.new(look.X, 0, look.Z).Magnitude > 0.01 and Vector3.new(look.X, 0, look.Z) or Vector3.new(0, 0, -1)):ToOrientation()
 S.yaw, S.pitch = y, -0.25
 S.lyaw, S.lpitch = 0, 0
+S.fOff = 0
+G.face = nil
+G.focusPos = nil
 setFPHidden(S.view == "first")
 syncControl()
 status("Наблюдение: " .. S.target.Name)
@@ -3452,6 +3470,89 @@ local delta = rot:VectorToWorldSpace(move) + Vector3.new(0, vert, 0)
 S.fpos = S.fpos + delta * spd * dt
 cam.CFrame = CFrame.new(S.fpos) * rot
 end
+-- куда «смотрит» NPC (угол по горизонтали). У многих моделей корень повёрнут боком/задом,
+-- поэтому при ходьбе берём направление движения и запоминаем поправку к повороту корня
+local function wrapA(a) return (a + math.pi) % (2 * math.pi) - math.pi end
+G.wrapA = wrapA
+function G.npcFacing(m, r, dt)
+local F = G.face
+local lv = r.CFrame.LookVector
+local rootYaw = math.atan2(-lv.X, -lv.Z)
+if not F or F.model ~= m then
+F = {model = m, off = 0, yaw = rootYaw, last = r.Position, vel = Vector3.zero}
+G.face = F
+end
+dt = math.max(dt, 1 / 240)
+local raw = (r.Position - F.last) / dt
+F.last = r.Position
+raw = Vector3.new(raw.X, 0, raw.Z)
+if raw.Magnitude > 200 then raw = Vector3.zero end   -- телепорт
+F.vel = F.vel:Lerp(raw, math.min(1, dt * 8))
+local target = rootYaw + F.off
+if F.vel.Magnitude > 2.5 then
+local velYaw = math.atan2(-F.vel.X, -F.vel.Z)
+F.off = F.off + wrapA(wrapA(velYaw - rootYaw) - F.off) * math.min(1, dt * 1.5)
+target = velYaw
+end
+local k = 1 - math.exp(-(S.followK or 5) * dt)
+F.yaw = F.yaw + wrapA(target - F.yaw) * k
+return F.yaw
+end
+-- точка глаз NPC: голова (часть или кость), иначе верх-перед модели
+function G.npcEye(m, r, yaw)
+local E = G.fpEye
+if not E or E.model ~= m then
+E = {model = m}
+local h = m:FindFirstChild("Head")
+if h and h:IsA("BasePart") then
+E.part = h
+else
+for _, d in ipairs(m:GetDescendants()) do
+if d:IsA("Bone") and d.Name:lower():find("head") then E.bone = d break end
+end
+end
+local ok, cf, size = pcall(function() return m:GetBoundingBox() end)
+if ok then E.size = size else E.size = Vector3.new(2, 5, 2) end
+G.fpEye = E
+end
+local fwd = Vector3.new(-math.sin(yaw), 0, -math.cos(yaw))
+if E.part and E.part.Parent then
+local sz = E.part.Size
+return E.part.Position + fwd * (math.max(sz.X, sz.Z) * 0.45) + Vector3.new(0, sz.Y * 0.15, 0)
+elseif E.bone and E.bone.Parent then
+local hs = math.max(0.6, E.size.Y * 0.08)
+return E.bone.TransformedWorldCFrame.Position + fwd * hs + Vector3.new(0, hs * 0.3, 0)
+end
+local sz = E.size
+local ok, cf = pcall(function() return m:GetBoundingBox() end)
+local top = ok and (cf.Position.Y + sz.Y * 0.5) or (r.Position.Y + 2)
+return Vector3.new(r.Position.X, top - sz.Y * 0.12, r.Position.Z) + fwd * (math.min(sz.X, sz.Z) * 0.45)
+end
+-- в 1-м лице прятать части тела, внутри которых оказалась камера (голова, шлем, морда большого монстра)
+function G.fpHideInside(camPos)
+local inside = G.fpInside or {}
+local now = {}
+for _, p in ipairs(G.fpParts or {}) do
+if p.Parent and not fpHidden[p] then
+local lp_ = p.CFrame:PointToObjectSpace(camPos)
+local h = p.Size * 0.5 + Vector3.new(0.7, 0.7, 0.7)
+if math.abs(lp_.X) < h.X and math.abs(lp_.Y) < h.Y and math.abs(lp_.Z) < h.Z then
+now[p] = true
+p.LocalTransparencyModifier = 1
+end
+end
+end
+for p in pairs(inside) do
+if not now[p] and p.Parent then p.LocalTransparencyModifier = 0 end
+end
+G.fpInside = now
+end
+function G.toggleFollow()
+S.follow = not S.follow
+S.fOff = 0
+status("Камера за спиной: " .. (S.follow and "ВКЛ" or "ВЫКЛ"))
+refreshButtons()
+end
 local function updateSpec(dt)
 local m = S.target
 local r = m and m.Parent and rootOf(m)
@@ -3461,8 +3562,19 @@ enterFree()
 return
 end
 local cam = getCam()
+local faceYaw = G.npcFacing(m, r, dt)
+if not S.rmb then   -- отпустил ПКМ — камера плавно возвращается за спину / вперёд
+local d = math.exp(-2.5 * dt)
+if S.follow then S.fOff = S.fOff * d end
+S.lyaw = S.lyaw * d
+S.lpitch = S.lpitch * d
+end
 if S.view == "third" then
-local focus = r.Position + Vector3.new(0, 2, 0)
+local want = r.Position + Vector3.new(0, 2, 0)
+G.focusPos = G.focusPos and G.focusPos:Lerp(want, math.min(1, dt * 14)) or want
+if (G.focusPos - want).Magnitude > 30 then G.focusPos = want end
+local focus = G.focusPos
+if S.follow then S.yaw = faceYaw + S.fOff end
 local cf = CFrame.new(focus) * CFrame.fromOrientation(S.pitch, S.yaw, 0) * CFrame.new(0, 0, S.dist)
 rayParams.FilterDescendantsInstances = {m, lp.Character}
 local dir = cf.Position - focus
@@ -3470,11 +3582,19 @@ local hit = workspace:Raycast(focus, dir, rayParams)
 local pos = hit and (hit.Position - dir.Unit * 0.5) or cf.Position
 cam.CFrame = CFrame.lookAt(pos, focus)
 else
-local h = headOf(m)
-cam.CFrame = h.CFrame * CFrame.new(0, 0, -0.5) * CFrame.fromOrientation(S.lpitch, S.lyaw, 0)
+-- 1-е лицо: позиция — глаза (сглаженно, без тряски анимации головы),
+-- поворот — куда смотрит/идёт NPC, без крена; ПКМ — осмотреться (отпустил — взгляд вернётся)
+local eye = G.npcEye(m, r, faceYaw)
+if not G.fpPos or (G.fpPos - eye).Magnitude > 20 then G.fpPos = eye end
+local e = G.fpPos
+local kx = math.min(1, dt * 25)
+local ky = math.min(1, dt * 12)
+G.fpPos = Vector3.new(e.X + (eye.X - e.X) * kx, e.Y + (eye.Y - e.Y) * ky, e.Z + (eye.Z - e.Z) * kx)
+cam.CFrame = CFrame.new(G.fpPos) * CFrame.fromOrientation(S.lpitch, faceYaw + S.lyaw, 0)
 for p in pairs(fpHidden) do
 if p.Parent then p.LocalTransparencyModifier = 1 end
 end
+G.fpHideInside(G.fpPos)
 end
 syncControl()
 local hum = S.controlled
@@ -3544,6 +3664,7 @@ enterSpec("first")
 end
 end,
 CameraLock = toggleLock,
+Follow = function() G.toggleFollow() end,
 Control = toggleControl,
 PrevNPC = function() cycle(-1) end,
 NextNPC = function() cycle(1) end,
@@ -3620,7 +3741,7 @@ S.syaw = S.syaw - d.X * sens
 S.spitch = math.clamp(S.spitch - d.Y * sens, -1.4, 1.4)
 elseif S.mode == "spec" then
 if S.view == "third" then
-S.yaw = S.yaw - d.X * sens
+if S.follow then S.fOff = S.fOff - d.X * sens else S.yaw = S.yaw - d.X * sens end
 S.pitch = math.clamp(S.pitch - d.Y * sens, -1.4, 1.4)
 else
 S.lyaw = S.lyaw - d.X * sens
@@ -3746,6 +3867,7 @@ local g = grid(p, 346)
 B.spec    = gbtn(g, "Наблюдать (3-е лицо)", function() enterSpec("third") end)
 B.first   = gbtn(g, "Вид от 1-го лица", function() enterSpec("first") end)
 B.lock    = gbtn(g, "Camera Lock", toggleLock)
+B.follow  = gbtn(g, "", function() G.toggleFollow() end)
 B.control = gbtn(g, "Управлять NPC", toggleControl)
 gbtn(g, "< Пред. NPC", function() cycle(-1) end)
 gbtn(g, "След. NPC >", function() cycle(1) end)
@@ -4056,6 +4178,10 @@ local function mark(b, on) if b then b.BackgroundColor3 = on and ON or BTN end e
 mark(B.spec, S.mode == "spec" and S.view == "third")
 mark(B.first, S.mode == "spec" and S.view == "first")
 mark(B.lock, S.lock)
+if B.follow then
+mark(B.follow, S.follow)
+B.follow.Text = "За спиной: " .. (S.follow and "ВКЛ" or "ВЫКЛ")
+end
 mark(B.control, npcCtl ~= nil)
 B.control.Text = "Управлять NPC: " .. (npcCtl and "ВКЛ" or "ВЫКЛ")
 mark(B.noclip, S.ctlNoclip)
