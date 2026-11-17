@@ -152,6 +152,7 @@ hideNPC = false, swap = false, listPlayers = false, basicAnim = false,
 selfEntry = nil, allEntry = nil,
 sfx = true,
 ctlMul = 1,   -- множитель скорости управляемого NPC
+ctlSteps = true,    -- звуки шагов у управляемого NPC (свои звуки NPC, иначе стандартные)
 ctlTrail = true,    -- красный хвост от спины управляемого NPC
 ctlNoclip = true,   -- копия NPC проходит сквозь стены/игроков/NPC
 hitPlayers = false, -- визуальные удары/KILL по обычным игрокам (видно только тебе)
@@ -1090,12 +1091,19 @@ entry.sounds = entry.sounds or {}
 for _, x in ipairs(entry.sounds) do
 if x.id == s.SoundId then
 if cat == "attack" and x.cat == "other" then x.cat = "attack" end
+if cat == "stepcand" and x.cat == "other" and (x.loop or (x.len or 0) < 2.5) then x.cat = "step" end
 return
 end
 end
 if #entry.sounds >= 40 then return end
-table.insert(entry.sounds, {id = s.SoundId, name = s.Name, cat = cat or G.classifySound(s.Name),
-vol = s.Volume, spd = s.PlaybackSpeed, loop = s.Looped})
+local c0 = G.classifySound(s.Name)
+local len = s.TimeLength
+if cat == "stepcand" then
+-- звук играл, пока NPC шёл (и не атаковал): короткий -> шаг; длинный/зацикленный — шаг только по названию
+if c0 == "other" and not s.Looped and (len == 0 or len < 2.5) then cat = "step" else cat = c0 end
+end
+table.insert(entry.sounds, {id = s.SoundId, name = s.Name, cat = cat or c0,
+vol = (G.mutedVol and G.mutedVol[s]) or s.Volume, spd = s.PlaybackSpeed, loop = s.Looped, len = len})
 end
 function G.readSounds(model, entry)
 entry.sounds = entry.sounds or {}
@@ -1217,6 +1225,147 @@ end
 end
 return false
 end
+-- ===================== ЗВУКИ ШАГОВ управляемого NPC =====================
+G.FOOT_DEF = "rbxasset://sounds/action_footsteps_plastic.mp3"   -- стандартные шаги Roblox (запасной вариант)
+function G.stepLists(entry)
+local walk, run, loopW, loopR = {}, {}, nil, nil
+for _, sd in ipairs(entry and entry.sounds or {}) do
+if sd.cat == "step" then
+local n = string.lower(sd.name or "")
+if not (n:find("jump") or n:find("land") or n:find("fall")) then
+local isRun = n:find("run") or n:find("sprint")
+local isWalk = n:find("walk")
+if sd.loop then
+if isRun then loopR = loopR or sd
+elseif isWalk then loopW = loopW or sd
+else loopW = loopW or sd loopR = loopR or sd end
+else
+if not isRun then walk[#walk + 1] = sd end
+if not isWalk then run[#run + 1] = sd end
+end
+end
+end
+end
+if #walk == 0 then walk = run end
+if #run == 0 then run = walk end
+return {walk = walk, run = run, loopW = loopW or loopR, loopR = loopR or loopW}
+end
+function G.stopStepLoop(st)
+if st.loop then pcall(function() st.loop:Destroy() end) end
+st.loop, st.loopId = nil, nil
+end
+-- длина шага по росту модели (для звука шагов, когда нет записанной анимации ходьбы)
+function G.strideOf(nc)
+local h = 5
+pcall(function() local _, sz = nc.model:GetBoundingBox() h = sz.Y end)
+return math.clamp(h * 0.45, 1.6, 10)
+end
+function G.ctlStepTick(nc, dt)
+local st = nc.steps
+if not st then
+st = {dist = 0, n = -1}
+nc.steps = st
+end
+local root = nc.root
+if not (S.ctlSteps and root and root.Parent) then G.stopStepLoop(st) return end
+local entry = nc.e and nc.e.entry
+local cnt = entry and entry.sounds and #entry.sounds or 0
+if cnt ~= st.n then
+st.n = cnt
+st.L = G.stepLists(entry)
+end
+local L = st.L
+local sp = G.ctlSpeed(nc)
+local moving = G.ctlMoveMag(nc) > 0.05 and sp > 1 and nc.kground ~= false
+local running = sp > G.RUN_SPEED
+-- 1) у NPC нет отдельных звуков шага: зацикленный звук (свой «Running» или стандартный), скорость — по скорости
+if #L.walk == 0 then
+local sd = running and L.loopR or L.loopW
+local id = sd and sd.id or G.FOOT_DEF
+if not (st.loop and st.loop.Parent and st.loopId == id) then
+G.stopStepLoop(st)
+local s = Instance.new("Sound")
+s.SoundId = id
+s.Looped = true
+s.Volume = sd and math.clamp(sd.vol or 0.6, 0.2, 3) or 0.65
+s.RollOffMinDistance = 12
+s.Parent = root
+st.loop, st.loopId = s, id
+st.loopSpd = (sd and sd.spd and sd.spd > 0) and sd.spd or 1
+end
+local s = st.loop
+if moving then
+s.PlaybackSpeed = st.loopSpd * math.clamp(sp / 16, 0.6, 2.2)
+if not s.IsPlaying then s:Play() end
+elseif s.IsPlaying then
+s:Stop()
+end
+return
+end
+G.stopStepLoop(st)
+-- 2) отдельные звуки шага: по фазе анимации ходьбы/бега (2 шага за цикл), иначе по пройденному пути
+local trig = false
+local e = nc.e
+local c = e and e.clipKey and e.clips and e.clips[e.clipKey]
+if moving and c and (e.clipKey == "walk" or e.clipKey == "run") and (c.len or 0) > 0.2 then
+local half = ((e.ct or 0) % c.len) / c.len >= 0.5 and 1 or 0
+if st.half ~= nil and half ~= st.half then trig = true end
+st.half = half
+elseif moving then
+st.half = nil
+st.stride = st.stride or G.strideOf(nc)
+local stride = st.stride * (running and 1.3 or 1)
+st.dist = st.dist + sp * dt
+if st.dist >= stride then
+st.dist = st.dist - stride
+trig = true
+end
+else
+st.half = nil
+st.stride = st.stride or G.strideOf(nc)
+st.dist = st.stride * 0.75   -- тронулся с места — первый шаг почти сразу
+end
+if not trig then return end
+local list = running and L.run or L.walk
+local i = math.random(1, #list)
+if #list > 1 and i == st.lastI then i = i % #list + 1 end
+st.lastI = i
+local sd = list[i]
+local s = Instance.new("Sound")
+s.SoundId = sd.id
+s.Volume = math.clamp(sd.vol or 0.6, 0.15, 3)
+s.PlaybackSpeed = ((sd.spd and sd.spd > 0) and sd.spd or 1) * (0.93 + math.random() * 0.14)
+s.RollOffMinDistance = 12
+s.Parent = root
+s:Play()
+game:GetService("Debris"):AddItem(s, 4)
+end
+-- пока управляешь копией, звуки настоящего (скрытого) NPC глушатся у тебя, чтобы не было «двойных» шагов
+function G.muteModel(m, on)
+G.mutedVol = G.mutedVol or setmetatable({}, {__mode = "k"})
+if G.muteConn then G.muteConn:Disconnect() G.muteConn = nil end
+if on then
+local function mu(d)
+if d:IsA("Sound") and G.mutedVol[d] == nil then
+G.mutedVol[d] = d.Volume
+pcall(function() d.Volume = 0 end)
+end
+end
+for _, d in ipairs(m:GetDescendants()) do mu(d) end
+G.muteConn = m.DescendantAdded:Connect(mu)
+else
+for snd, v in pairs(G.mutedVol) do
+if snd.Parent then pcall(function() snd.Volume = v end) end
+end
+G.mutedVol = setmetatable({}, {__mode = "k"})
+end
+end
+function G.toggleCtlSteps()
+S.ctlSteps = not S.ctlSteps
+if not S.ctlSteps and npcCtl and npcCtl.steps then G.stopStepLoop(npcCtl.steps) end
+status("Звуки шагов: " .. (S.ctlSteps and "ВКЛ" or "ВЫКЛ"))
+refreshButtons()
+end
 function G.sfxSave(entry)
 if entry.desc then entry.desc.snd = entry.sounds end
 saveLib()
@@ -1226,7 +1375,12 @@ function G.observeSounds(model, entry, duration)
 task.spawn(function()
 entry.sounds = entry.sounds or {}
 local watched, cons = {}, {}
-local function cat() return G.isAttacking(model) and "attack" or nil end
+local mv = {on = false}
+local function cat()
+if G.isAttacking(model) then return "attack" end
+if mv.on then return "stepcand" end
+return nil
+end
 local function watch(s)
 if watched[s] then return end
 watched[s] = true
@@ -1253,6 +1407,14 @@ end
 end))
 local t0 = os.clock()
 while os.clock() - t0 < duration and model.Parent do
+local r = rootOf(model)
+if r then
+local p = r.Position
+local v = r.AssemblyLinearVelocity
+local moved = mv.pos and Vector3.new(p.X - mv.pos.X, 0, p.Z - mv.pos.Z).Magnitude or 0
+mv.on = moved > 0.4 or Vector3.new(v.X, 0, v.Z).Magnitude > 2
+mv.pos = p
+end
 for s in pairs(watched) do
 if s.Parent and s.IsPlaying then G.addSound(entry, s, cat()) end
 end
@@ -1995,6 +2157,7 @@ if a[1].Parent and a[2] then a[1].Transform = a[2] end
 end
 end
 if ne.fakeAtk then G.applyFakeAttack(ne) end
+pcall(G.ctlStepTick, nc, dt)
 local ttr = nc.trail
 if ttr then
 local moving = G.ctlMoveMag(nc) > 0.1
@@ -3281,6 +3444,9 @@ model.Parent = getSkinFolder()
 -- ставим копию ровно на место оригинала (смена корня не должна её разворачивать)
 pcall(function() model:PivotTo(orig:GetPivot() * pv0:Inverse() * model:GetPivot()) end)
 vhHide(orig, "ctl") -- оригинал скрыт только у тебя
+pcall(G.muteModel, orig, true)
+-- пока управляешь, слушаем настоящего NPC: если он ходит, его звуки шагов подхватятся автоматически
+pcall(G.observeSounds, orig, entry, 45)
 local e = {skin = model, root = root, t0 = os.clock(), motors = {}, fb = {}, entry = entry}
 e.tracks, e.attack = G.setupTracks(model, entry)
 local dec = G.entryClips(entry)
@@ -3358,6 +3524,7 @@ if c.groundConn then c.groundConn:Disconnect() end
 pcall(function() RunService:UnbindFromRenderStep("CineKin") end)
 pcall(function() c.model:Destroy() end)
 pcall(vhShow, c.orig, "ctl")
+pcall(G.muteModel, c.orig, false)
 local rr = c.realRoot
 if rr and rr.Parent then pcall(function() rr.Anchored = c.wasAnchored end) end
 if S.mode == "self" then exitAll() end
@@ -3863,7 +4030,7 @@ end
 local B = {}
 do
 local p = pages["NPC"]
-local g = grid(p, 346)
+local g = grid(p, 378)
 B.spec    = gbtn(g, "Наблюдать (3-е лицо)", function() enterSpec("third") end)
 B.first   = gbtn(g, "Вид от 1-го лица", function() enterSpec("first") end)
 B.lock    = gbtn(g, "Camera Lock", toggleLock)
@@ -3901,7 +4068,8 @@ refreshButtons()
 end)
 gbtn(g, "ТП к выбранному (T)", function() if S.target then G.tpTo(S.target) else status("Сначала выбери NPC") end end)
 gbtn(g, "ТП к след. NPC (G)", function() G.tpNext() end)
-local list = scroller(p, 354)
+B.steps = gbtn(g, "", function() G.toggleCtlSteps() end)
+local list = scroller(p, 386)
 local rows = {}
 rebuildNPCList = function()
 local alive = {}
@@ -4205,6 +4373,10 @@ B.basic.Text = "Только базовая анимация: " .. (S.basicAnim 
 mark(B.sfx, S.sfx)
 B.sfx.Text = "Звуки атаки: " .. (S.sfx and "ВКЛ" or "ВЫКЛ")
 mark(B.trail, S.ctlTrail)
+if B.steps then
+mark(B.steps, S.ctlSteps)
+B.steps.Text = "Звуки шагов: " .. (S.ctlSteps and "ВКЛ" or "ВЫКЛ")
+end
 B.trail.Text = "Хвост от спины: " .. (S.ctlTrail and "ВКЛ" or "ВЫКЛ")
 mark(B.puppet, puppet ~= nil)
 B.puppet.Text = "Кукла (защита): " .. (puppet and "ВКЛ" or "ВЫКЛ")
