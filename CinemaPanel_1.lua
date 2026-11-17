@@ -1278,6 +1278,7 @@ local L = st.L
 local sp = G.ctlSpeed(nc)
 local moving = G.ctlMoveMag(nc) > 0.05 and sp > 1 and nc.kground ~= false
 local running = sp > G.RUN_SPEED
+if nc.e and nc.e.runHint ~= nil then running = nc.e.runHint end
 -- 1) у NPC нет отдельных звуков шага: зацикленный звук (свой «Running» или стандартный), скорость — по скорости
 if #L.walk == 0 then
 local sd = running and L.loopR or L.loopW
@@ -1834,11 +1835,20 @@ end
 -- сглаживание (ease in-out), чтобы переход не был «ступенькой»
 local ws = w * w * (3 - 2 * w)
 local fa, fb = c.frames[ia], c.frames[ib]
+local amp = e.ampMul or 1
+local mean = amp > 1.01 and G.clipMean(c) or nil
 for _, pr in ipairs(e.cm) do
 local m, j = pr[1], pr[2]
 local x, y = fa[j], fb[j]
 if x and y and m.Parent then
 local cf = x:Lerp(y, a)
+local mj = mean and mean[j]
+if mj then   -- бег из ходьбы: размах движений больше, чем у шага
+local rel = mj:Inverse() * cf
+local ax, ang = rel:ToAxisAngle()
+local rot = (ang > 1e-4 and ax.X == ax.X) and CFrame.fromAxisAngle(ax, ang * amp) or (rel - rel.Position)
+cf = mj * (CFrame.new(rel.Position * amp) * rot)
+end
 if w < 1 then
 local f0 = e.blendFrom[m]
 if f0 then cf = f0:Lerp(cf, ws) end
@@ -1846,6 +1856,20 @@ end
 m.Transform = cf
 end
 end
+end
+-- средняя поза цикла по каждому суставу (вокруг неё усиливается размах при беге)
+function G.clipMean(c)
+if c.mean then return c.mean end
+local mean = {}
+for k, fr in ipairs(c.frames) do
+for j, cf in pairs(fr) do
+if typeof(cf) == "CFrame" then
+mean[j] = mean[j] and mean[j]:Lerp(cf, 1 / k) or cf
+end
+end
+end
+c.mean = mean
+return mean
 end
 -- обрезать цикл (стоя/ходьба/бег) там, где поза ближе всего к первому кадру: без рывка на стыке
 function G.bestLoop(f)
@@ -1881,7 +1905,10 @@ elseif e.sm > 2.5 or hint then
 e.moving = true
 end
 local want = "idle"
-if e.moving then want = (e.sm > G.RUN_SPEED) and "run" or "walk" end
+if e.moving then
+if e.runHint ~= nil then want = e.runHint and "run" or "walk"
+else want = (e.sm > G.RUN_SPEED) and "run" or "walk" end
+end
 local useRecorded = not (S.basicAnim and e.limbs and #e.limbs > 0)
 local lackMove = false -- нет записи ходьбы -> процедурная ходьба вместо скольжения в позе idle
 local cl = e.clips
@@ -1915,6 +1942,10 @@ if c then
 stopTracks()
 local scale = 1
 if want ~= "idle" and c.sp and c.sp > 0.5 then scale = math.clamp(e.sm / c.sp, 0.5, 2) end
+-- своей записи бега нет — бег делается из ходьбы: быстрее и с бóльшим размахом рук/ног
+local synth = (want == "run" and ck == "walk")
+if synth then scale = math.clamp(math.max(scale, 1.5), 1.5, 2.3) end
+e.ampMul = (e.ampMul or 1) + ((synth and 1.35 or 1) - (e.ampMul or 1)) * math.min(dt * 6, 1)
 if ck ~= e.clipKey then e.ct = 0 end   -- новая анимация начинается с начала цикла
 e.ct = (e.ct or 0) + dt * scale
 G.applyClip(e, c, e.ct, true, ck)
@@ -1950,7 +1981,9 @@ if w then e.tracks[w]:Play(0.2) end
 e.state = w
 end
 if w and w ~= "idle" then
-pcall(function() e.tracks[w]:AdjustSpeed(math.clamp(e.sm / 14, 0.4, 2.5)) end)
+local ts = math.clamp(e.sm / 14, 0.4, 2.5)
+if want == "run" and w == "walk" then ts = math.max(ts, 1.6) end   -- анимации бега у NPC нет — ускоренная ходьба
+pcall(function() e.tracks[w]:AdjustSpeed(ts) end)
 end
 return true
 end
@@ -1962,7 +1995,7 @@ if tr.IsPlaying then tr:Stop(0.1) end
 end
 e.state = nil
 end
-local target = e.moving and math.clamp(e.sm / 16, 0.35, 1) or 0
+local target = e.moving and math.clamp(e.sm / 16, 0.35, e.runHint and 1.45 or 1) or 0
 e.amp = (e.amp or 0) + (target - (e.amp or 0)) * math.min(dt * 8, 1)
 e.wp = (e.wp or 0) + dt * (4 + 8 * e.amp)
 local sn = math.sin(e.wp)
@@ -2151,6 +2184,9 @@ ne.cm = G.buildClipMotors(ne.skin, dec)
 end
 end
 local nsp = G.ctlSpeed(nc)
+-- бег у управляемого NPC — по Shift (или если разогнан намного быстрее обычного шага)
+ne.runHint = G.ctlMoveMag(nc) > 0.1 and ((UIS:IsKeyDown(K.LeftShift) and not typing())
+or nsp > math.max(G.RUN_SPEED, (nc.baseSpeed or 16) * 1.6))
 if not animateActor(ne, dt, nsp, G.ctlMoveMag(nc) > 0.05) then
 for _, a in ipairs(ne.arms or {}) do
 if a[1].Parent and a[2] then a[1].Transform = a[2] end
@@ -3253,8 +3289,14 @@ elseif ctl.kvel.Magnitude > 0.5 then
 targetYaw = math.atan2(-ctl.kvel.X, -ctl.kvel.Z)
 end
 local yaw = lerpAngle(curYaw, targetYaw, math.min(dt * 12, 1))
+-- при беге корпус наклоняется вперёд
+local wantLean = 0
+if ctl.e and ctl.e.runHint and ctl.kground then
+wantLean = 0.1 * math.clamp(ctl.kvel.Magnitude / math.max(speed, 1), 0, 1)
+end
+ctl.klean = (ctl.klean or 0) + (wantLean - (ctl.klean or 0)) * math.min(dt * 6, 1)
 pcall(function()
-rr.CFrame = CFrame.new(np.X, y, np.Z) * CFrame.fromOrientation(0, yaw, 0) * ctl.kTilt
+rr.CFrame = CFrame.new(np.X, y, np.Z) * CFrame.fromOrientation(0, yaw, 0) * CFrame.Angles(-ctl.klean, 0, 0) * ctl.kTilt
 end)
 end)
 end
