@@ -85,6 +85,7 @@ ReviveAll   = K.PageUp,
 Exit        = K.Backspace,
 CleanScreen = K.RightControl,
 Follow      = K.J,
+Monster     = K.M,
 }
 local KEY_LABELS = {
 {"TogglePanel", "Показать/скрыть панель"},
@@ -117,6 +118,7 @@ local KEY_LABELS = {
 {"Exit", "Выйти из всех режимов"},
 {"CleanScreen", "Чистый экран (скрыть весь UI)"},
 {"Follow", "3-е лицо: авто-камера за спиной NPC"},
+{"Monster", "Режим «Монстр»: хоррор-анимации на себе"},
 }
 local genv = (getgenv and getgenv()) or _G
 if genv.__CinePanelCleanup then pcall(genv.__CinePanelCleanup) end
@@ -161,6 +163,11 @@ follow = true,       -- 3-е лицо: камера сама держится з
 followK = 5,        -- скорость доворота камеры за спину (больше = жёстче)
 fOff = 0,           -- смещение камеры мышью от «за спиной» (возвращается к 0)
 cleanTags = true,   -- в чистом экране прятать и ники / полоски HP / метки над головами
+oneHit = true,      -- NPC умирает с 1 удара (иначе с 3)
+deathFall = true,   -- убитый NPC падает телом (иначе рассыпается частицами)
+killCam = true,     -- смертельный удар показывается из глаз NPC
+monster = false,    -- режим «Монстр»: свои хоррор-анимации на твоём персонаже (видно только тебе)
+monCrawl = true,    -- в режиме «Монстр» бег на четвереньках
 antiIdle = true,    -- анти-бездействие: персонаж сам шевелится, если долго стоит
 idleInt = 10,       -- через сколько секунд без движения шевелиться
 }
@@ -2837,6 +2844,162 @@ end
 end
 end
 end)
+-- ===================== ПАДЕНИЕ ТЕЛА (ragdoll копии, только у тебя) =====================
+function G.ragdollFall(model, fromPos)
+local parts, motors = {}, {}
+for _, d in ipairs(model:GetDescendants()) do
+if d:IsA("BasePart") then parts[#parts + 1] = d
+elseif d:IsA("Motor6D") then motors[#motors + 1] = d end
+end
+local root = rootOf(model)
+if not root then return end
+local hum = model:FindFirstChildOfClass("Humanoid")
+if hum then
+pcall(function()
+hum.BreakJointsOnDeath = false
+hum.PlatformStand = true
+hum.EvaluateStateMachine = false
+end)
+end
+local jointed = #motors >= 4
+if jointed then
+-- суставы -> шарниры с ограничениями: тело обмякает и падает
+for _, m in ipairs(motors) do
+local p0, p1 = m.Part0, m.Part1
+if p0 and p1 and p0.Name ~= "HumanoidRootPart" and p1.Name ~= "HumanoidRootPart" then
+pcall(function()
+local a0 = Instance.new("Attachment")
+a0.CFrame = m.C0
+a0.Parent = p0
+local a1 = Instance.new("Attachment")
+a1.CFrame = m.C1
+a1.Parent = p1
+local bs = Instance.new("BallSocketConstraint")
+bs.Attachment0, bs.Attachment1 = a0, a1
+bs.LimitsEnabled = true
+bs.UpperAngle = 55
+bs.TwistLimitsEnabled = true
+bs.TwistLowerAngle, bs.TwistUpperAngle = -35, 35
+bs.Parent = p0
+m.Enabled = false
+end)
+end
+end
+else
+-- модель без суставов (кости/цельный меш): падает целиком, как столб
+for _, p in ipairs(parts) do
+if p ~= root then
+pcall(function()
+local w = Instance.new("WeldConstraint")
+w.Part0, w.Part1 = root, p
+w.Parent = root
+end)
+end
+end
+end
+-- тело не должно толкать твоего персонажа
+local mine = {}
+for _, p in ipairs(lp.Character and lp.Character:GetDescendants() or {}) do
+if p:IsA("BasePart") then mine[#mine + 1] = p end
+end
+local solid = {}
+for _, p in ipairs(parts) do
+pcall(function()
+local vis = p.Transparency < 1 and p.Size.Magnitude > 0.3
+p.Anchored = false
+p.CanQuery, p.CanTouch = false, false
+p.CanCollide = vis and (p ~= root or not jointed)
+p.Massless = (p == root and jointed)
+if p.CanCollide then solid[#solid + 1] = p end
+end)
+end
+table.sort(solid, function(a, b) return a.Size.Magnitude > b.Size.Magnitude end)
+for i = 1, math.min(#solid, 20) do
+for _, q in ipairs(mine) do
+local nc = Instance.new("NoCollisionConstraint")
+nc.Part0, nc.Part1 = solid[i], q
+nc.Parent = solid[i]
+end
+end
+task.defer(function()
+pcall(function()
+local d = root.Position - fromPos
+d = Vector3.new(d.X, 0, d.Z)
+d = d.Magnitude > 0.05 and d.Unit or Vector3.new(0, 0, -1)
+local mass = root.AssemblyMass
+root:ApplyImpulse((d * 22 + Vector3.new(0, 10, 0)) * mass)
+local size = 4
+pcall(function() local _, sz = model:GetBoundingBox() size = sz.Y end)
+root:ApplyAngularImpulse(Vector3.yAxis:Cross(d) * mass * size * 2.5)
+end)
+end)
+end
+-- ===================== ВИД ЖЕРТВЫ: смертельный удар из глаз NPC =====================
+function G.killCamEnd(token)
+if token and token ~= G.kcToken then return end
+pcall(function() RunService:UnbindFromRenderStep("CineKillCam") end)
+for p in pairs(G.kcHidden or {}) do
+if p.Parent then p.LocalTransparencyModifier = 0 end
+end
+G.kcHidden = {}
+local sv = G.kcSaved
+G.kcSaved = nil
+if sv and S.mode == "none" then
+local cam = getCam()
+cam.CameraType = sv.type or Enum.CameraType.Custom
+local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+cam.CameraSubject = (sv.subj and sv.subj.Parent) and sv.subj or hum
+end
+end
+function G.killCam(orig, lead)
+if not S.killCam then return end
+G.kcToken = (G.kcToken or 0) + 1
+local token = G.kcToken
+local cam = getCam()
+G.kcSaved = G.kcSaved or {type = cam.CameraType, subj = cam.CameraSubject}
+G.kcHidden = G.kcHidden or {}
+local t0 = os.clock()
+local dur = (lead or 0.3) + 2
+local pos
+local seenSrc = {}
+pcall(function() RunService:UnbindFromRenderStep("CineKillCam") end)
+RunService:BindToRenderStep("CineKillCam", Enum.RenderPriority.Camera.Value + 5, function(dt)
+local ok = pcall(function()
+local t = os.clock() - t0
+-- кто сейчас «тело» NPC: оригинал -> копия во время удара -> падающее тело
+local src = orig
+local f = fights[orig]
+if f and f.fake and f.fake.Parent then src = f.fake end
+local dc = deadChars[orig]
+if dc and dc.fake and dc.fake:IsA("Model") and dc.fake.Parent then src = dc.fake end
+local r = src and src.Parent and rootOf(src)
+local me = myRootPart()
+if t > dur or not r or not me then G.killCamEnd(token) return end
+if not seenSrc[src] then   -- прячем голову/аксессуары NPC, чтобы не смотреть изнутри
+seenSrc[src] = true
+for _, p in ipairs(src:GetDescendants()) do
+if p:IsA("BasePart") and (p.Name == "Head" or (p.Parent and p.Parent:IsA("Accessory"))) then
+p.LocalTransparencyModifier = 1
+G.kcHidden[p] = true
+end
+end
+end
+local tgt = me.Position + Vector3.new(0, 1.2, 0)
+local flat = Vector3.new(tgt.X - r.Position.X, 0, tgt.Z - r.Position.Z)
+local yaw = flat.Magnitude > 0.05 and math.atan2(-flat.X, -flat.Z) or 0
+local eye = G.npcEye(src, r, yaw)
+pos = pos and pos:Lerp(eye, math.min(1, dt * 20)) or eye
+cam.CameraType = Enum.CameraType.Scriptable
+cam.CFrame = CFrame.lookAt(pos, tgt)
+end)
+if not ok then G.killCamEnd(token) end
+end)
+end
+-- смертельный ли следующий удар по этому NPC (для «вида жертвы»)
+function G.isLethalNext(orig)
+local f = fights[orig]
+return ((f and f.hits) or 0) + 1 >= (S.oneHit and 1 or HITS_TO_KILL)
+end
 function G.finishKill(orig, f)
 fights[orig] = nil
 local clone = f.fake
@@ -2847,11 +3010,19 @@ local ae = G.actor()
 G.playSfxAt(ae and ae.entry or nil, "death", p, 1.2, true)
 end
 end)
+local dummy
+if S.deathFall then
+-- тело падает (ragdoll) и лежит до «возвращения» NPC
+local me = myRootPart()
+pcall(G.ragdollFall, clone, me and me.Position or (f.root.Position + Vector3.new(0, 0, 3)))
+dummy = clone
+else
 pcall(G.disintegrate, clone)
 pcall(function() clone:Destroy() end)
-local dummy = Instance.new("Folder")
+dummy = Instance.new("Folder")
 dummy.Name = "CineDeathDummy"
 dummy.Parent = G.getFx()
+end
 deadChars[orig] = {fake = dummy}
 local se2 = skins[orig]
 if se2 then se2.dead = true end
@@ -2899,12 +3070,12 @@ task.delay(0.07, function()
 if f.fake.Parent then f.fake:PivotTo(base + dir * 0.25) end
 end)
 end)
-if f.hits >= HITS_TO_KILL then
+if f.hits >= (S.oneHit and 1 or HITS_TO_KILL) then
 G.finishKill(orig, f)
 else
 G.cameraShake(0.55, 0.22, 3)
 G.screenFlash(Color3.new(1, 1, 1), 0.88, 0.15)
-status("Удар " .. f.hits .. " из " .. HITS_TO_KILL)
+status("Удар " .. f.hits .. " из " .. (S.oneHit and 1 or HITS_TO_KILL))
 end
 end
 local function isCandidate(m, h)
@@ -2991,6 +3162,8 @@ pcall(function()
 G.playSfxAt(e and e.entry or nil, "attack", myRoot and myRoot.Position or cf.Position, 1, true)
 end)
 local delay = G.playAttackAnim(e)
+if S.monster and not e then G.monAttack() delay = 0.25 end
+if S.killCam and G.isLethalNext(best) then G.killCam(best, delay) end
 task.delay(delay, function()
 local ok, err = pcall(function()
 if best.Parent or fights[best] then landHit(best) end
@@ -3032,7 +3205,7 @@ end
 -- Атака: замах + звук, а если перед тобой (до 7 studs) есть NPC — один удар по нему (3 удара = смерть)
 function G.swing()
 local e = G.actor()
-if not e then status("Нет модели для атаки: включи управление NPC (F5), куклу или модель на себя") return end
+if not e and not S.monster then status("Нет модели для атаки: включи управление NPC (F5), куклу, модель на себя или режим «Монстр» (M)") return end
 if S.attackCd and os.clock() < S.attackCd then return end
 S.attackCd = os.clock() + 0.6
 local origin, cf = G_origin()
@@ -3041,7 +3214,8 @@ pcall(function()
 G.playSfxAt(e.entry, "attack", myRoot and myRoot.Position or cf.Position, 1, true)
 end)
 local tgt = G.findFrontTarget(origin, cf.LookVector, 7)
-local delay = G.playAttackAnim(e)
+local delay = e and G.playAttackAnim(e) or 0.25   -- 0.25 c — момент удара в выпаде режима «Монстр»
+if tgt and S.killCam and G.isLethalNext(tgt) then G.killCam(tgt, delay) end
 if tgt then
 task.delay(delay, function()
 if tgt.Parent or fights[tgt] then pcall(landHit, tgt) end
@@ -3898,7 +4072,11 @@ CopySounds = function() G.copySounds() end,
 KillFront = function() pressKillFX() killFront() end,
 KillNearest = function() pressKillFX() G.killNearest() end,
 KillSelected = function() pressKillFX() G.killSelected() end,
-Attack = function() G.swing() end,
+Attack = function()
+if S.monster then G.monAttack() end
+G.swing()
+end,
+Monster = function() G.toggleMonster() end,
 TeleportSel = function() if S.target then G.tpTo(S.target) else status("Сначала выбери NPC") end end,
 TeleportNext = function() G.tpNext() end,
 Puppet = function() togglePuppet() end,
@@ -4170,7 +4348,12 @@ end
 end
 do
 local p = pages["Мир"]
-local g = grid(p, 318)
+local g = grid(p, 414)
+B.monster = gbtn(g, "", function() G.toggleMonster() end)
+B.monCrawl = gbtn(g, "", function() S.monCrawl = not S.monCrawl refreshButtons() end)
+B.oneHit = gbtn(g, "", function() S.oneHit = not S.oneHit refreshButtons() end)
+B.deathFall = gbtn(g, "", function() S.deathFall = not S.deathFall refreshButtons() end)
+B.killCam = gbtn(g, "", function() S.killCam = not S.killCam refreshButtons() end)
 B.antiIdle = gbtn(g, "", function() if G.toggleAntiIdle then G.toggleAntiIdle() end end)
 B.idleInt = gbtn(g, "", function() if G.cycleIdleInt then G.cycleIdleInt() end end)
 B.clean = gbtn(g, "", function() if G.toggleClean then G.toggleClean() end end)
@@ -4195,11 +4378,11 @@ B.sfx = gbtn(g, "", function() S.sfx = not S.sfx refreshButtons() end)
 gbtn(g, "Копировать звуки NPC", G.copySounds)
 B.trail = gbtn(g, "", function() S.ctlTrail = not S.ctlTrail refreshButtons() end)
 gbtn(g, "Тест звуков", function() G.testSfx() end)
-B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 324),
+B.info = new("TextLabel", {Size = UDim2.new(1, 0, 0, 40), Position = UDim2.fromOffset(0, 420),
 BackgroundTransparency = 1, TextColor3 = TXT, Font = Enum.Font.Gotham, TextSize = 12,
 TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, p)
 local function sbox(cat, ph, i)
-local b = new("TextBox", {Size = UDim2.new(1 / 3, -4, 0, 24), Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 370),
+local b = new("TextBox", {Size = UDim2.new(1 / 3, -4, 0, 24), Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 466),
 PlaceholderText = ph, Text = "", ClearTextOnFocus = false, BackgroundColor3 = PANEL, TextColor3 = TXT,
 PlaceholderColor3 = Color3.fromRGB(140, 140, 150), Font = Enum.Font.Gotham, TextSize = 11, BorderSizePixel = 0}, p)
 new("UICorner", {CornerRadius = UDim.new(0, 5)}, b)
@@ -4427,6 +4610,20 @@ B.puppet2.Text = "Кукла: " .. (puppet and "ВКЛ" or "ВЫКЛ")
 B.smooth.Text = "Плавно: " .. (S.smooth and "ВКЛ" or "ВЫКЛ")
 B.markers.Text = "Маркеры: " .. (S.markers and "ВКЛ" or "ВЫКЛ")
 B.hideSelf.Text = "Скрывать и себя: " .. (S.hideSelf and "ДА" or "НЕТ")
+if B.oneHit then
+mark(B.oneHit, S.oneHit)
+B.oneHit.Text = "Убийство: " .. (S.oneHit and "с 1 удара" or "с 3 ударов")
+mark(B.deathFall, S.deathFall)
+B.deathFall.Text = "Смерть NPC: " .. (S.deathFall and "падает телом" or "рассыпается")
+mark(B.killCam, S.killCam)
+B.killCam.Text = "Вид жертвы при убийстве: " .. (S.killCam and "ВКЛ" or "ВЫКЛ")
+end
+if B.monster then
+mark(B.monster, S.monster)
+B.monster.Text = "Монстр (" .. KEYS.Monster.Name .. "): " .. (S.monster and "ВКЛ" or "ВЫКЛ")
+mark(B.monCrawl, S.monCrawl)
+B.monCrawl.Text = "Бег монстра: " .. (S.monCrawl and "на четвереньках" or "стоя")
+end
 mark(B.antiIdle, S.antiIdle)
 B.antiIdle.Text = "Анти-бездействие: " .. (S.antiIdle and "ВКЛ" or "ВЫКЛ")
 B.idleInt.Text = "Шевелиться каждые: " .. S.idleInt .. " с"
@@ -4813,12 +5010,218 @@ if skinFolder then skinFolder:Destroy() end
 if markerFolder then markerFolder:Destroy() end
 pcall(function() RunService:UnbindFromRenderStep("CinePanel") end)
 pcall(function() RunService:UnbindFromRenderStep("CineJoy") end)
+pcall(function() RunService:UnbindFromRenderStep("CineMonster") end)
+pcall(function() if G.killCamEnd then G.killCamEnd() end end)
+pcall(function() if G.monReset then G.monReset() end end)
 for _, c in ipairs(conns) do c:Disconnect() end
 if gui then gui:Destroy() end
 if killGui then killGui:Destroy() end
 if G.sprintGui then G.sprintGui:Destroy() end
 S.fovKick = 0
 genv.__CinePanelCleanup = nil
+end
+-- ===================== РЕЖИМ «МОНСТР» =====================
+-- Свои хоррор-анимации на ТВОЁМ персонаже (R15, например бандл-монстр): сгорбленная рваная ходьба,
+-- бег на четвереньках, подёргивания и резкие повороты головы к ближайшему, выпад-атака (Z).
+-- Суставы меняются только у тебя (поверх анимаций игры) — другим игрокам ничего не отправляется.
+G.MON_J = {"Root", "Waist", "Neck", "LeftShoulder", "RightShoulder", "LeftElbow", "RightElbow",
+"LeftWrist", "RightWrist", "LeftHip", "RightHip", "LeftKnee", "RightKnee", "LeftAnkle", "RightAnkle"}
+function G.monRig(char)
+local R = G.monR
+if R and R.char == char then return R end
+local hum = char:FindFirstChildOfClass("Humanoid")
+if not hum or hum.RigType ~= Enum.HumanoidRigType.R15 then
+G.monR = {char = char, bad = true}
+status("Режим «Монстр» работает только на R15-персонаже")
+return G.monR
+end
+local J = {}
+for _, d in ipairs(char:GetDescendants()) do
+if d:IsA("Motor6D") then J[d.Name] = d end
+end
+local function sy(n)
+local p = char:FindFirstChild(n)
+return p and p:IsA("BasePart") and p.Size.Y or 1
+end
+R = {char = char, hum = hum, J = J, root = char:FindFirstChild("HumanoidRootPart"),
+L1 = (sy("LeftUpperLeg") + sy("RightUpperLeg")) / 2, L2 = (sy("LeftLowerLeg") + sy("RightLowerLeg")) / 2,
+ph = 0, head = Vector2.zero, headT = Vector2.zero, nextTw = 0, spasm = 0, amp = 0, crawl = 0, air = 0,
+lookT = 0, lookYaw = nil}
+G.monR = R
+return R
+end
+-- угол (по горизонтали, относительно корпуса) на ближайшего игрока/NPC в 45 studs, иначе nil
+function G.monLook(R)
+local t = os.clock()
+if t < R.lookT then return R.lookYaw end
+R.lookT = t + 0.3
+local me = R.root.Position
+local best, bd = nil, 45
+local function try(p)
+if p and p.Parent then
+local d = (p.Position - me).Magnitude
+if d < bd and d > 1 then best, bd = p, d end
+end
+end
+for _, pl in ipairs(Players:GetPlayers()) do
+if pl ~= lp and pl.Character then try(pl.Character:FindFirstChild("HumanoidRootPart")) end
+end
+for _, e in ipairs(npcs) do try(e.root) end
+R.lookYaw = nil
+if best then
+local d = R.root.CFrame:PointToObjectSpace(best.Position)
+R.lookYaw = math.atan2(-d.X, -d.Z)
+if math.abs(R.lookYaw) > 1.6 then R.lookYaw = nil end   -- цель сзади — голову так не свернуть
+end
+return R.lookYaw
+end
+function G.monAttack()
+if not S.monster then return end
+local R = G.monR
+if R and not R.bad then R.atk = os.clock() end
+end
+function G.monReset()
+local R = G.monR
+if R and R.J then
+for _, n in ipairs(G.MON_J) do
+local m = R.J[n]
+if m and m.Parent then pcall(function() m.Transform = CFrame.new() end) end
+end
+end
+G.monR = nil
+end
+function G.monFrame(dt)
+local char = lp.Character
+if not char then return end
+local R = G.monRig(char)
+if R.bad then return end
+if not (R.root and R.root.Parent and R.hum.Parent) then G.monR = nil return end
+local J = R.J
+dt = math.min(dt, 0.1)
+local v = R.root.AssemblyLinearVelocity
+local sp = Vector3.new(v.X, 0, v.Z).Magnitude
+local moving = sp > 1.5
+local run = moving and ((UIS:IsKeyDown(K.LeftShift) and not typing()) or sp > 20)
+local inAir = R.hum.FloorMaterial == Enum.Material.Air
+R.amp = R.amp + ((moving and 1 or 0) - R.amp) * math.min(1, dt * 6)
+R.crawl = R.crawl + (((run and S.monCrawl and not inAir) and 1 or 0) - R.crawl) * math.min(1, dt * 4)
+R.air = R.air + ((inAir and 1 or 0) - R.air) * math.min(1, dt * 8)
+-- рваный ритм шага: фаза то ускоряется, то почти замирает
+local freq = (run and 2.1 or 1.25) * math.clamp(sp / (run and 22 or 12), 0.6, 1.8)
+if moving then
+local jit = 1 + 0.6 * math.sin(R.ph * 3)
+R.ph = R.ph + dt * freq * 2 * math.pi * math.max(0.2, jit)
+end
+local ph = R.ph
+local s, c = math.sin(ph), math.cos(ph)
+local t = os.clock()
+-- голова: резкие «щелчки» в случайные стороны + иногда судорога всего тела
+if t > R.nextTw then
+R.nextTw = t + 0.4 + math.random() * 2.2
+R.headT = Vector2.new((math.random() - 0.5) * 1.1, (math.random() - 0.5) * 1.1)
+if math.random() < 0.3 then R.spasm = t + 0.15 + math.random() * 0.15 end
+end
+local ly = G.monLook(R)
+local hT = R.headT
+if ly then hT = Vector2.new(math.clamp(ly, -1.2, 1.2), hT.Y * 0.5) end
+R.head = R.head:Lerp(hT, math.min(1, dt * 22))
+local sh = (t < R.spasm) and 0.14 or 0.012
+local function n() return (math.random() - 0.5) * 2 * sh end
+local a, cr, air = R.amp, R.crawl, R.air
+-- атака: выпад вперёд с захватом
+local atk = 0
+if R.atk then
+local u = (t - R.atk) / 0.5
+if u >= 1 then R.atk = nil else atk = math.sin(math.pi * u) end
+end
+-- корпус (минус по X = наклон вперёд)
+local rootP = -0.2 - 0.85 * cr - 0.25 * atk
+local waistP = -0.35 * (1 - cr) - 0.1 * cr - 0.35 * atk + 0.05 * math.sin(ph * 2) * a
+local neckP = math.clamp(-(rootP + waistP) * 0.85, 0, 1.2) - 0.1 + 0.3 * atk
+-- ноги: бёдра держат ноги почти вертикально при наклоне + полусогнутые колени
+local base = -rootP
+local hipA, hipB, kA, kB
+if cr > 0.01 then
+-- галоп: ноги почти вместе, руки в противофазе
+hipA = base + 0.25 + 0.75 * a * s
+hipB = base + 0.25 + 0.75 * a * math.sin(ph + 0.45)
+else
+hipA = base + 0.3 + 0.6 * a * s
+hipB = base + 0.3 - 0.6 * a * s
+end
+kA = -0.7 - 0.8 * a * math.max(0, c) - 0.4 * cr
+kB = -0.7 - 0.8 * a * math.max(0, -c) - 0.4 * cr
+-- прыжок: ноги поджаты
+hipA = hipA + (base + 1.1 - hipA) * air
+hipB = hipB + (base + 0.9 - hipB) * air
+kA = kA + (-1.6 - kA) * air
+kB = kB + (-1.5 - kB) * air
+local function legH(hp, kn)
+local th = rootP + hp
+return R.L1 * math.cos(th) + R.L2 * math.cos(th + kn)
+end
+local drop = (R.L1 + R.L2) - (legH(hipA, kA) + legH(hipB, kB)) / 2
+drop = drop * (1 - air) + 0.15 * math.abs(math.sin(ph)) * a * (1 - air)
+-- руки: висят длинно и мёртво (идёт), тянутся к земле (галоп), тянутся вперёд (бег стоя), хватают (атака)
+local hang = -(rootP + waistP) * 0.9
+local shA = hang + 0.15 - 0.3 * a * s
+local shB = hang + 0.15 + 0.3 * a * s
+local elA, elB = 0.35, 0.35
+if run and not S.monCrawl then
+shA, shB = 1.3 + 0.25 * s, 1.3 - 0.25 * s
+elA, elB = 0.2, 0.2
+end
+if cr > 0.01 then
+local gA = hang + 0.35 + 0.9 * a * math.sin(ph + math.pi)
+local gB = hang + 0.35 + 0.9 * a * math.sin(ph + math.pi + 0.35)
+shA, shB = shA + (gA - shA) * cr, shB + (gB - shB) * cr
+elA, elB = elA + (0.15 - elA) * cr, elB + (0.15 - elB) * cr
+end
+shA = shA + (2.3 - shA) * air * 0.7
+shB = shB + (2.3 - shB) * air * 0.7
+shA = shA + (1.9 - shA) * atk
+shB = shB + (1.9 - shB) * atk
+elA, elB = elA * (1 - atk) + 0.05 * atk, elB * (1 - atk) + 0.05 * atk
+local spread = 0.15 + 0.25 * atk + 0.3 * air
+local function set(name, cf)
+local m = J[name]
+if m and m.Parent then m.Transform = cf end
+end
+local A = CFrame.Angles
+set("Root", CFrame.new(0, -drop, -0.9 * atk) * A(rootP + n(), 0.12 * a * c * (1 - cr) + n(), n()))
+set("Waist", A(waistP + n(), 0.15 * a * s + n(), 0.06 * a * c + n()))
+set("Neck", A(neckP + n(), R.head.X + n() * 2, R.head.Y + n() * 2))
+set("LeftShoulder", A(shA + n(), n(), -spread + n()))
+set("RightShoulder", A(shB + n(), n(), spread + n()))
+set("LeftElbow", A(elA + n(), 0, 0))
+set("RightElbow", A(elB + n(), 0, 0))
+set("LeftWrist", A(0.35 + n(), 0, 0))
+set("RightWrist", A(0.35 + n(), 0, 0))
+set("LeftHip", A(hipA + n(), 0, -0.08))
+set("RightHip", A(hipB + n(), 0, 0.08))
+set("LeftKnee", A(kA, 0, 0))
+set("RightKnee", A(kB, 0, 0))
+set("LeftAnkle", A(-(rootP + hipA + kA) * 0.85, 0, 0))
+set("RightAnkle", A(-(rootP + hipB + kB) * 0.85, 0, 0))
+end
+function G.toggleMonster()
+S.monster = not S.monster
+pcall(function() RunService:UnbindFromRenderStep("CineMonster") end)
+if S.monster then
+G.monR = nil
+RunService:BindToRenderStep("CineMonster", Enum.RenderPriority.Last.Value, function(dt)
+local ok, err = pcall(G.monFrame, dt)
+if not ok and not G.monErr then
+G.monErr = true
+warn("[CinePanel] Монстр: " .. tostring(err))
+end
+end)
+status("Режим «Монстр» ВКЛ: Shift — бег, Z — выпад. Видно только тебе")
+else
+G.monReset()
+status("Режим «Монстр» ВЫКЛ")
+end
+refreshButtons()
 end
 -- каждый шаг запуска в своём pcall: сбой одного шага (например, файл камер) больше не ломает весь запуск
 function G.step(name, fn)
